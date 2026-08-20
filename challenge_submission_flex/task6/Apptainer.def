@@ -1,0 +1,53 @@
+Bootstrap: docker
+From: pytorch/pytorch:2.11.0-cuda12.6-cudnn9-runtime
+
+%labels
+    Author FOMO26 Challenge
+    Version v1.0.0
+    Description FOMO26 Tasks 6 & 7 - Linear Probing / Bias & Fairness (FlexiCT Embeddings)
+
+%environment
+    export PYTHONUNBUFFERED=1
+    export LC_ALL=C.UTF-8
+    export FLEXICT_2D_CHECKPOINT=/app/weights/2D_final_model.pth
+
+%files
+    ./predict.py /app/predict.py
+    ./requirements.txt /app/requirements.txt
+
+    # FlexiCT source
+    ./dinov3_downstream/flexi_ct /app/dinov3_downstream/flexi_ct
+    # Downstream code (for model architecture)
+    ./dinov3_downstream/downstream/__init__.py /app/dinov3_downstream/downstream/__init__.py
+    ./dinov3_downstream/downstream/3d_classify /app/dinov3_downstream/downstream/3d_classify
+    ./dinov3_downstream/downstream/3d_regression /app/dinov3_downstream/downstream/3d_regression
+
+    # Model weights
+    ./weights/best.pt /app/weights/best.pt
+    ./weights/2D_final_model.pth /app/weights/2D_final_model.pth
+
+%post
+    mkdir -p /input /output /app
+    pip install --no-cache-dir -U pip
+    pip install --no-cache-dir -r /app/requirements.txt
+    chmod +x /app/predict.py
+
+%runscript
+    exec python /app/predict.py "$@"
+
+%help
+    FOMO26 Tasks 6 & 7: Linear Probing / Bias & Fairness (Embedding Extraction)
+
+    This container extracts a fixed-length 1D embedding vector from any MR image
+    using the pretrained FlexiCT encoder with cross-slice pooling.
+
+    Build:
+        apptainer build --fakeroot task6_embedding.sif Apptainer.def --arch amd64
+
+    Run:
+        apptainer run --nv \
+            --bind /path/to/input:/input:ro \
+            --bind /path/to/output:/output \
+            task6_embedding.sif \
+            --input /input/scan.nii.gz \
+            --output /output/embedding.npy

@@ -1,0 +1,9 @@
+nibabel
+numpy
+scipy
+scikit-learn
+einops
+timm
+batchgenerators
+batchgeneratorsv2
+dynamic-network-architectures
