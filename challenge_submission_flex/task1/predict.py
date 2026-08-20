@@ -4,7 +4,7 @@
 Predicts the probability of infarct presence from multi-modal brain MRI.
 Uses FlexiCT 2D slice encoder + cross-slice pooling (patch_cls) + classification head.
 
-Supports model ensembling: provide multiple checkpoint paths to average predictions.
+Supports model ensembling: averages predictions from the top 3 selected folds.
 
 Modality handling:
     When trained with --modality_pool each, the model processes each modality
@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import os
 import sys
 from pathlib import Path
@@ -62,17 +63,49 @@ if str(REPO_ROOT) not in sys.path:
 # ============================================================================
 # MODEL WEIGHT PATHS
 # ============================================================================
-MODEL_PATHS = [
-    WEIGHTS_DIR / "fold_0" / "best.pt",
-    WEIGHTS_DIR / "fold_1" / "best.pt",
-    WEIGHTS_DIR / "fold_2" / "best.pt",
-    WEIGHTS_DIR / "fold_3" / "best.pt",
-    WEIGHTS_DIR / "fold_4" / "best.pt",
-]
+DEFAULT_RESULTS_DIR = (
+    REPO_ROOT
+    / "results"
+    / "3d_classify"
+    / "fomo_slice_cls_each_robust_zscore"
+    / "CLS002_FOMO26_Infarct"
+)
+SELECTED_FOLDS = ("fold_0", "fold_4", "fold_1")
 
-FLEXICT_2D_CHECKPOINT_PATH = WEIGHTS_DIR / "2D_final_model.pth"
 
-# Set env var so flexi_ct.checkpoints can resolve the backbone
+def _resolve_backbone_checkpoint() -> Path:
+    env_path = os.environ.get("FLEXICT_2D_CHECKPOINT")
+    if env_path:
+        path = Path(env_path)
+        if path.exists():
+            return path
+
+    candidates = [
+        WEIGHTS_DIR / "2D_final_model_fomo100k_gram.pth",
+        WEIGHTS_DIR / "2D_final_model.pth",
+        REPO_ROOT
+        / "ckpts"
+        / "pretrain_fomo_100k_pretrained_flexcit_base_g8_e200_p8_mri_gram"
+        / "2D_final_model_fomo100k_gram.pth",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+
+    raise FileNotFoundError(
+        "Could not resolve the FlexiCT 2D backbone checkpoint. Checked:\n"
+        + "\n".join(f"  - {p}" for p in candidates)
+        + (
+            "\n  - $FLEXICT_2D_CHECKPOINT"
+            if env_path
+            else "\nSet FLEXICT_2D_CHECKPOINT to a valid checkpoint path if needed."
+        )
+    )
+
+
+FLEXICT_2D_CHECKPOINT_PATH = _resolve_backbone_checkpoint()
+
+# Set env var so flexi_ct.checkpoints can resolve the backbone consistently.
 os.environ["FLEXICT_2D_CHECKPOINT"] = str(FLEXICT_2D_CHECKPOINT_PATH)
 
 # ─── Imports from repo ────────────────────────────────────────────────────────
@@ -188,15 +221,62 @@ def build_model(ckpt: dict, device: torch.device) -> tuple:
     return model, saved_args
 
 
-def get_available_model_paths() -> list[Path]:
-    """Filter MODEL_PATHS to only those that exist on disk."""
-    available = [p for p in MODEL_PATHS if p.exists()]
-    if not available:
-        raise FileNotFoundError(
-            f"No model checkpoints found. Expected at least one of:\n"
-            + "\n".join(f"  - {p}" for p in MODEL_PATHS)
-        )
-    return available
+def _candidate_model_roots() -> list[Path]:
+    env_root = os.environ.get("TASK1_MODEL_ROOT")
+    roots = []
+    if env_root:
+        roots.append(Path(env_root))
+    roots.extend(
+        [
+            WEIGHTS_DIR,
+            DEFAULT_RESULTS_DIR,
+        ]
+    )
+    deduped = []
+    seen = set()
+    for root in roots:
+        key = str(root)
+        if key not in seen:
+            deduped.append(root)
+            seen.add(key)
+    return deduped
+
+
+def get_model_paths() -> list[Path]:
+    """Resolve the selected ensemble checkpoints from known local/container roots."""
+    roots = _candidate_model_roots()
+    attempted = []
+    for root in roots:
+        model_paths = [root / fold / "best.pt" for fold in SELECTED_FOLDS]
+        attempted.extend(model_paths)
+        if all(path.exists() for path in model_paths):
+            metrics_path = root / SELECTED_FOLDS[0] / "metrics.json"
+            if metrics_path.exists():
+                print(f"Using model root: {root}")
+            return model_paths
+
+    raise FileNotFoundError(
+        "Could not find all selected Task 1 ensemble checkpoints.\n"
+        "Expected these files:\n"
+        + "\n".join(f"  - {p}" for p in attempted)
+    )
+
+
+def print_selected_folds_summary(model_paths: list[Path]) -> None:
+    print("Selected ensemble folds (ranked by lowest validation loss):")
+    for path in model_paths:
+        metrics_path = path.with_name("metrics.json")
+        summary = ""
+        if metrics_path.exists():
+            metrics = json.loads(metrics_path.read_text())
+            best_val_loss = metrics.get("best_val_loss")
+            test_metrics = metrics.get("test", {})
+            summary = (
+                f" | best_val_loss={best_val_loss:.6f}"
+                f", test_auc={test_metrics.get('auc', float('nan')):.3f}"
+                f", test_bal_acc={test_metrics.get('bal_acc', float('nan')):.3f}"
+            )
+        print(f"  - {path.parent.name}: {path}{summary}")
 
 
 def predict_single_model(
@@ -250,12 +330,12 @@ def main():
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ── Discover available model checkpoints ──────────────────────────────────
-    model_paths = get_available_model_paths()
+    # ── Discover ensemble checkpoints ─────────────────────────────────────────
+    model_paths = get_model_paths()
     n_models = len(model_paths)
+    print(f"Backbone checkpoint: {FLEXICT_2D_CHECKPOINT_PATH}")
     print(f"Ensemble size: {n_models} model(s)")
-    for i, p in enumerate(model_paths):
-        print(f"  [{i}] {p}")
+    print_selected_folds_summary(model_paths)
 
     # ── Load and preprocess input volumes ─────────────────────────────────────
     volume = collect_modalities(args)  # [C, H, W, D]

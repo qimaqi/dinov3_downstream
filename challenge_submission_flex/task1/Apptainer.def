@@ -11,7 +11,8 @@ From: pytorch/pytorch:2.11.0-cuda12.6-cudnn9-runtime
     export LC_ALL=C.UTF-8
     export PYTHONDONTWRITEBYTECODE=1
     # FlexiCT 2D backbone checkpoint path inside the container
-    export FLEXICT_2D_CHECKPOINT=/app/weights/2D_final_model.pth
+    export FLEXICT_2D_CHECKPOINT=/app/weights/2D_final_model_fomo100k_gram.pth
+    export TASK1_MODEL_ROOT=/app/weights
 
 %files
     # ── Main inference script ─────────────────────────────────────────────────
@@ -27,15 +28,15 @@ From: pytorch/pytorch:2.11.0-cuda12.6-cudnn9-runtime
 
     # ── Model weights ─────────────────────────────────────────────────────────
     # Pretrained FlexiCT 2D backbone (shared across all folds)
-    ./weights/2D_final_model.pth /app/weights/2D_final_model.pth
+    ./weights/2D_final_model_fomo100k_gram.pth /app/weights/2D_final_model_fomo100k_gram.pth
 
-    # Trained classifier checkpoints — one per fold for ensemble
-    # Only include the folds you have; predict.py auto-detects which exist
+    # Trained classifier checkpoints — top 3 folds for ensemble
     ./weights/fold_0/best.pt /app/weights/fold_0/best.pt
-    ./weights/fold_1/best.pt /app/weights/fold_1/best.pt
-    ./weights/fold_2/best.pt /app/weights/fold_2/best.pt
-    ./weights/fold_3/best.pt /app/weights/fold_3/best.pt
     ./weights/fold_4/best.pt /app/weights/fold_4/best.pt
+    ./weights/fold_1/best.pt /app/weights/fold_1/best.pt
+    ./weights/fold_0/metrics.json /app/weights/fold_0/metrics.json
+    ./weights/fold_4/metrics.json /app/weights/fold_4/metrics.json
+    ./weights/fold_1/metrics.json /app/weights/fold_1/metrics.json
 
 %post
     mkdir -p /input /output /app
@@ -49,7 +50,7 @@ From: pytorch/pytorch:2.11.0-cuda12.6-cudnn9-runtime
 %help
     FOMO26 Task 1: Infarct Detection (Binary Classification)
     Model: FlexiCT 2D encoder + cross-slice pooling (patch_cls) + classifier
-    Ensemble: averages predictions across multiple fold checkpoints
+    Ensemble: averages predictions across the 3 best folds
 
     Build (from challenge_submission_flex/task1/):
         apptainer build --fakeroot task1_infarct.sif Apptainer.def --arch amd64

@@ -1,0 +1,8 @@
+Bootstrap: docker
+From: alpine:3.20
+
+%post
+    echo "hello from build" > /hello.txt
+
+%runscript
+    cat /hello.txt

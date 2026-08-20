@@ -20,6 +20,20 @@ if [ ! -d "../../flexi_ct" ]; then
     exit 1
 fi
 
+REQUIRED_FILES=(
+    "./weights/2D_final_model_fomo100k_gram.pth"
+    "./weights/fold_0/best.pt"
+    "./weights/fold_4/best.pt"
+    "./weights/fold_1/best.pt"
+)
+
+for file in "${REQUIRED_FILES[@]}"; do
+    if [ ! -f "${file}" ]; then
+        echo "ERROR: Missing required Task 1 weight file: ${SCRIPT_DIR}/${file}"
+        exit 1
+    fi
+done
+
 # Remove old image if it exists
 if [ -f "${SIF_NAME}" ]; then
     echo "Removing existing ${SIF_NAME}..."
