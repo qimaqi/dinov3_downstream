@@ -18,6 +18,7 @@ import argparse
 import hashlib
 import json
 import math
+import pickle
 import sys
 import time
 from dataclasses import dataclass
@@ -176,9 +177,17 @@ def _as_image_label(sample: object, path: str) -> tuple[torch.Tensor, torch.Tens
 
 
 class FOMOClsRegDataset(Dataset):
-    def __init__(self, files: list[str], resize_hw: tuple[int, int] | None = None):
+    def __init__(
+        self,
+        files: list[str],
+        resize_hw: tuple[int, int] | None = None,
+        target_spacing_xy: tuple[float, float] | None = None,
+        pad_hw: tuple[int, int] | None = None,
+    ):
         self.files = files
         self.resize_hw = resize_hw
+        self.target_spacing_xy = target_spacing_xy
+        self.pad_hw = pad_hw
 
     def __len__(self) -> int:
         return len(self.files)
@@ -192,6 +201,8 @@ class FOMOClsRegDataset(Dataset):
             image = image.unsqueeze(0)
         if image.ndim != 4:
             raise ValueError(f"Expected 4D [C,H,W,D] image tensor from {path}, got {tuple(image.shape)}")
+        image = respace_xy_volume_chwd(image, _load_spacing_metadata(path), self.target_spacing_xy)
+        image = pad_volume_chwd(image, self.pad_hw)
         if self.resize_hw is not None:
             image = image.permute(3, 0, 1, 2)
             image = F.interpolate(image, size=self.resize_hw, mode="bilinear", align_corners=False)
@@ -215,6 +226,72 @@ def _parse_hw_resize(value: str | None) -> tuple[int, int] | None:
             return int(h_str), int(w_str)
     size = int(value)
     return size, size
+
+
+def _metadata_path_for_sample(path: str) -> Path:
+    return Path(path).with_suffix(".pkl")
+
+
+def _load_spacing_metadata(path: str) -> tuple[float, float] | None:
+    meta_path = _metadata_path_for_sample(path)
+    if not meta_path.exists():
+        return None
+    with open(meta_path, "rb") as f:
+        meta = pickle.load(f)
+    spacing = meta.get("original_spacing") or meta.get("new_spacing")
+    if spacing is None or len(spacing) < 2:
+        return None
+    return float(spacing[0]), float(spacing[1])
+
+
+def _parse_spacing_xy(value: str | None) -> tuple[float, float] | None:
+    if value is None or value.lower() in {"none", "null"}:
+        return None
+    parts = tuple(float(item) for item in value.split(",") if item.strip())
+    if len(parts) != 2:
+        raise ValueError(f"Expected X,Y spacing tuple, got: {value}")
+    return parts
+
+
+def respace_xy_volume_chwd(
+    image: torch.Tensor,
+    source_spacing_xy: tuple[float, float] | None,
+    target_spacing_xy: tuple[float, float] | None,
+) -> torch.Tensor:
+    if source_spacing_xy is None or target_spacing_xy is None:
+        return image
+    src_x, src_y = source_spacing_xy
+    tgt_x, tgt_y = target_spacing_xy
+    target_h = max(1, int(round(image.shape[1] * src_y / tgt_y)))
+    target_w = max(1, int(round(image.shape[2] * src_x / tgt_x)))
+    if (target_h, target_w) == tuple(image.shape[1:3]):
+        return image
+    image_dhw = image.permute(0, 3, 1, 2).unsqueeze(0)
+    image_dhw = F.interpolate(image_dhw, size=(image.shape[3], target_h, target_w), mode="trilinear", align_corners=False)
+    return image_dhw.squeeze(0).permute(0, 2, 3, 1).contiguous()
+
+
+def pad_volume_chwd(image: torch.Tensor, target_hw: tuple[int, int] | None) -> torch.Tensor:
+    if target_hw is None:
+        return image
+    target_h, target_w = target_hw
+    height, width = image.shape[1:3]
+    if height > target_h or width > target_w:
+        raise ValueError(
+            f"pad_hw={target_hw} is smaller than image shape {(height, width)} after respacing. "
+            "Increase pad_hw or use resize_hw."
+        )
+    pad_h = target_h - height
+    pad_w = target_w - width
+    top = pad_h // 2
+    bottom = pad_h - top
+    left = pad_w // 2
+    right = pad_w - left
+    if pad_h == 0 and pad_w == 0:
+        return image
+    image_dhw = image.permute(0, 3, 1, 2)
+    image_dhw = F.pad(image_dhw, (left, right, top, bottom))
+    return image_dhw.permute(0, 2, 3, 1).contiguous()
 
 
 def _cache_subject_root(cache_root: Path, source_path: str) -> Path:
@@ -729,13 +806,15 @@ def run_one_task(args: argparse.Namespace, task: str) -> None:
     n_outputs = int(metadata["metadata"].get("n_classes", 1))
     split_files = load_split_files(task_dir, args.train_split, args.test_split, args.fold)
     resize_hw = _parse_hw_resize(args.resize_hw)
+    target_spacing_xy = _parse_spacing_xy(args.target_spacing_xy)
+    pad_hw = _parse_hw_resize(args.pad_hw)
     output_dir = Path(args.output_dir) / task / f"fold_{args.fold}"
     output_dir.mkdir(parents=True, exist_ok=True)
     last_ckpt_path = output_dir / "last.pt"
 
-    train_ds = FOMOClsRegDataset(split_files.train, resize_hw=resize_hw)
-    val_ds = FOMOClsRegDataset(split_files.val, resize_hw=resize_hw)
-    test_ds = FOMOClsRegDataset(split_files.test, resize_hw=resize_hw)
+    train_ds = FOMOClsRegDataset(split_files.train, resize_hw=resize_hw, target_spacing_xy=target_spacing_xy, pad_hw=pad_hw)
+    val_ds = FOMOClsRegDataset(split_files.val, resize_hw=resize_hw, target_spacing_xy=target_spacing_xy, pad_hw=pad_hw)
+    test_ds = FOMOClsRegDataset(split_files.test, resize_hw=resize_hw, target_spacing_xy=target_spacing_xy, pad_hw=pad_hw)
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
@@ -787,7 +866,8 @@ def run_one_task(args: argparse.Namespace, task: str) -> None:
     )
     print(
         f"slice_pool={args.slice_pool} modality_pool={args.modality_pool} "
-        f"resize_hw={resize_hw} slice_size={args.slice_size} max_slices={args.max_slices}"
+        f"spacing_xy={target_spacing_xy} pad_hw={pad_hw} resize_hw={resize_hw} "
+        f"slice_size={args.slice_size} max_slices={args.max_slices}"
     )
 
     for epoch in range(start_epoch, args.epochs):
@@ -911,6 +991,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--slice_axis", type=int, default=-1)
     parser.add_argument("--slice_size", type=int, default=224)
     parser.add_argument("--resize_hw", default=None, help="Optional HxW resize before slicing (e.g. 256x256).")
+    parser.add_argument("--target_spacing_xy", default=None, help="Optional X,Y spacing in mm as 'X,Y' before padding/resizing.")
+    parser.add_argument("--pad_hw", default=None, help="Optional zero-pad target H,W as 'H,W' after respacing.")
     parser.add_argument("--patch_size", type=int, default=8)
     parser.add_argument("--max_slices", type=int, default=None)
     parser.add_argument("--transformer_depth", type=int, default=2)

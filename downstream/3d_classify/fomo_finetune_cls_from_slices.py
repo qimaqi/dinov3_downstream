@@ -19,6 +19,7 @@ import argparse
 import hashlib
 import json
 import math
+import pickle
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -147,12 +148,125 @@ def resize_volume_chwd(image: torch.Tensor, target_hw: tuple[int, int] | None) -
     return image_dhw.squeeze(0).permute(0, 2, 3, 1).contiguous()
 
 
+def _metadata_path_for_sample(path: str) -> Path:
+    return Path(path).with_suffix(".pkl")
+
+
+def _load_spacing_metadata(path: str) -> tuple[float, float] | None:
+    meta_path = _metadata_path_for_sample(path)
+    if not meta_path.exists():
+        return None
+    with open(meta_path, "rb") as f:
+        meta = pickle.load(f)
+    spacing = meta.get("original_spacing") or meta.get("new_spacing")
+    if spacing is None or len(spacing) < 2:
+        return None
+    return float(spacing[0]), float(spacing[1])
+
+
+def _parse_spacing_xy(value: str | None) -> tuple[float, float] | None:
+    if value is None or value.lower() in {"none", "null"}:
+        return None
+    parts = tuple(float(item) for item in value.split(",") if item.strip())
+    if len(parts) != 2:
+        raise ValueError(f"Expected X,Y spacing tuple, got: {value}")
+    return parts
+
+
+def respace_xy_volume_chwd(
+    image: torch.Tensor,
+    source_spacing_xy: tuple[float, float] | None,
+    target_spacing_xy: tuple[float, float] | None,
+) -> torch.Tensor:
+    if source_spacing_xy is None or target_spacing_xy is None:
+        return image
+    src_x, src_y = source_spacing_xy
+    tgt_x, tgt_y = target_spacing_xy
+    target_h = max(1, int(round(image.shape[1] * src_y / tgt_y)))
+    target_w = max(1, int(round(image.shape[2] * src_x / tgt_x)))
+    if (target_h, target_w) == tuple(image.shape[1:3]):
+        return image
+    image_dhw = image.permute(0, 3, 1, 2).unsqueeze(0)
+    image_dhw = F.interpolate(image_dhw, size=(image.shape[3], target_h, target_w), mode="trilinear", align_corners=False)
+    return image_dhw.squeeze(0).permute(0, 2, 3, 1).contiguous()
+
+
+def pad_volume_chwd(image: torch.Tensor, target_hw: tuple[int, int] | None) -> torch.Tensor:
+    if target_hw is None:
+        return image
+    target_h, target_w = target_hw
+    height, width = image.shape[1:3]
+    if height > target_h or width > target_w:
+        raise ValueError(
+            f"pad_hw={target_hw} is smaller than image shape {(height, width)} after respacing. "
+            "Increase pad_hw or use resize_hw."
+        )
+    pad_h = target_h - height
+    pad_w = target_w - width
+    top = pad_h // 2
+    bottom = pad_h - top
+    left = pad_w // 2
+    right = pad_w - left
+    if pad_h == 0 and pad_w == 0:
+        return image
+    image_dhw = image.permute(0, 3, 1, 2)
+    image_dhw = F.pad(image_dhw, (left, right, top, bottom))
+    return image_dhw.permute(0, 2, 3, 1).contiguous()
+
+
+def normalize_volume_chwd(
+    image: torch.Tensor,
+    method: str,
+    low_percentile: float,
+    high_percentile: float,
+) -> torch.Tensor:
+    if method == "none":
+        return torch.nan_to_num(image).float()
+
+    out_channels = []
+    for channel_idx in range(image.shape[0]):
+        channel = image[channel_idx]
+        values = channel[torch.isfinite(channel) & (channel != 0)]
+        if values.numel() < 16:
+            out_channels.append(torch.nan_to_num(channel).float())
+            continue
+        lo = torch.quantile(values, low_percentile / 100.0)
+        hi = torch.quantile(values, high_percentile / 100.0)
+        clipped = channel.clamp(min=lo.item(), max=hi.item())
+        if method == "robust_minmax":
+            denom = max(float((hi - lo).item()), 1e-6)
+            normalized = (clipped - lo) / denom
+        elif method == "robust_zscore":
+            clipped_values = clipped[torch.isfinite(clipped) & (clipped != 0)]
+            mean = clipped_values.mean()
+            std = clipped_values.std(unbiased=False).clamp_min(1e-6)
+            normalized = (clipped - mean) / std
+        else:
+            raise ValueError(f"Unknown mri_normalization: {method}")
+        out_channels.append(torch.nan_to_num(normalized).float())
+    return torch.stack(out_channels, dim=0)
+
+
 class FOMOClsRegDataset(Dataset):
     """Asparagus-style classification dataset reader for processed FOMO .pt files."""
 
-    def __init__(self, files: Iterable[str], resize_hw: tuple[int, int] | None = None):
+    def __init__(
+        self,
+        files: Iterable[str],
+        resize_hw: tuple[int, int] | None = None,
+        target_spacing_xy: tuple[float, float] | None = None,
+        pad_hw: tuple[int, int] | None = None,
+        mri_normalization: str = "robust_zscore",
+        mri_low_percentile: float = 0.5,
+        mri_high_percentile: float = 99.5,
+    ):
         self.files = list(files)
         self.resize_hw = resize_hw
+        self.target_spacing_xy = target_spacing_xy
+        self.pad_hw = pad_hw
+        self.mri_normalization = mri_normalization
+        self.mri_low_percentile = mri_low_percentile
+        self.mri_high_percentile = mri_high_percentile
 
     def __len__(self) -> int:
         return len(self.files)
@@ -161,7 +275,15 @@ class FOMOClsRegDataset(Dataset):
         path = self.files[index]
         sample = torch.load(path, map_location="cpu")
         image, label = _as_image_label(sample, path)
+        image = respace_xy_volume_chwd(image, _load_spacing_metadata(path), self.target_spacing_xy)
+        image = pad_volume_chwd(image, self.pad_hw)
         image = resize_volume_chwd(image, self.resize_hw)
+        image = normalize_volume_chwd(
+            image,
+            method=self.mri_normalization,
+            low_percentile=self.mri_low_percentile,
+            high_percentile=self.mri_high_percentile,
+        )
         return {
             "file_path": path,
             "image": image,
@@ -395,6 +517,18 @@ class FlexiCTSliceVolumeClassifier(nn.Module):
         indices = self._slice_selection_indices(slices.shape[1], device=slices.device)
         return indices.detach().cpu().tolist()
 
+    def modality_views(self, volume: torch.Tensor) -> torch.Tensor:
+        if volume.ndim != 5:
+            raise ValueError(f"Expected [B,C,H,W,D], got {tuple(volume.shape)}")
+        if self.modality_pool == "each":
+            batch, channels, height, width, depth = volume.shape
+            return volume.permute(0, 1, 2, 3, 4).reshape(batch * channels, 1, height, width, depth)
+        if self.modality_pool == "mean":
+            return volume.mean(dim=1, keepdim=True)
+        if self.modality_pool == "first":
+            return volume[:, :1]
+        raise ValueError(f"Unknown modality_pool: {self.modality_pool}")
+
     def _volume_to_slices(self, volume: torch.Tensor) -> torch.Tensor:
         if volume.ndim != 5:
             raise ValueError(f"Expected [B,C,H,W,D], got {tuple(volume.shape)}")
@@ -404,16 +538,7 @@ class FlexiCTSliceVolumeClassifier(nn.Module):
 
         if axis != 4:
             volume = volume.movedim(axis, 4)
-
-        if self.modality_pool == "mean":
-            volume = volume.mean(dim=1, keepdim=True)
-        elif self.modality_pool == "first":
-            volume = volume[:, :1]
-        elif self.modality_pool == "each":
-            batch, channels, height, width, depth = volume.shape
-            volume = volume.reshape(batch, 1, height, width, channels * depth)
-        else:
-            raise ValueError(f"Unknown modality_pool: {self.modality_pool}")
+        volume = self.modality_views(volume)
 
         return volume.permute(0, 4, 1, 2, 3).contiguous()
 
@@ -519,6 +644,14 @@ class FlexiCTSliceVolumeClassifier(nn.Module):
         return self.head(volume_token)
 
 
+def _repeat_labels_for_modalities(labels: torch.Tensor, num_modalities: int) -> torch.Tensor:
+    return labels.repeat_interleave(num_modalities)
+
+
+def _pool_logits_across_modalities(logits: torch.Tensor, batch_size: int, num_modalities: int) -> torch.Tensor:
+    return logits.view(batch_size, num_modalities, -1).mean(dim=1)
+
+
 def _prepare_cached_batch(cached_list: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
     keys = ("cls_tokens", "patch_tokens", "register_tokens")
     return {key: torch.cat([item[key] for item in cached_list], dim=0) for key in keys}
@@ -582,45 +715,76 @@ def maybe_load_or_create_cached_features(
     resize_hw = _parse_hw_resize(args.resize_hw)
     images = batch["image"].to(device)
     active_cache_root = from_cache_root if from_cache_root is not None else cache_root
-    cache_files = [
-        _cache_slice_files_for_sample(
-            cache_root=active_cache_root,
-            source_path=path,
-            slice_ids=model.selected_slice_ids(images[idx : idx + 1]),
-            slice_axis=args.slice_axis,
-            max_slices=args.max_slices,
-            slice_size=args.slice_size,
-            patch_size=args.patch_size,
-            modality_pool=args.modality_pool,
-            resize_hw=resize_hw,
-        )
-        for idx, path in enumerate(file_paths)
-    ]
+    cache_files = []
+    modality_counts = []
+    for idx, path in enumerate(file_paths):
+        sample = images[idx : idx + 1]
+        sample_views = model.modality_views(sample)
+        modality_counts.append(sample_views.shape[0])
+        sample_cache_files = []
+        for modality_idx in range(sample_views.shape[0]):
+            modality_path = f"{path}::modality_{modality_idx}"
+            sample_cache_files.append(
+                _cache_slice_files_for_sample(
+                    cache_root=active_cache_root,
+                    source_path=modality_path,
+                    slice_ids=model.selected_slice_ids(sample_views[modality_idx : modality_idx + 1]),
+                    slice_axis=args.slice_axis,
+                    max_slices=args.max_slices,
+                    slice_size=args.slice_size,
+                    patch_size=args.patch_size,
+                    modality_pool=args.modality_pool,
+                    resize_hw=resize_hw,
+                )
+            )
+        cache_files.append(sample_cache_files)
 
     if from_cache_root is not None:
-        missing = [str(path) for sample_paths in cache_files for path in sample_paths if not path.exists()]
+        missing = [
+            str(path)
+            for sample_modalities in cache_files
+            for sample_paths in sample_modalities
+            for path in sample_paths
+            if not path.exists()
+        ]
         if missing:
             raise FileNotFoundError(f"Missing cached features in --from_cache_path: {missing[0]}")
-        return None, _prepare_cached_batch([_load_cached_slices(sample_paths, device) for sample_paths in cache_files])
+        loaded = []
+        for sample_modalities in cache_files:
+            loaded.extend(_load_cached_slices(sample_paths, device) for sample_paths in sample_modalities)
+        return None, _prepare_cached_batch(loaded)
 
     if not args.cache:
         return images, None
 
-    uncached_indices = [idx for idx, sample_paths in enumerate(cache_files) if any(not path.exists() for path in sample_paths)]
+    uncached_indices = [
+        idx
+        for idx, sample_modalities in enumerate(cache_files)
+        if any(not path.exists() for sample_paths in sample_modalities for path in sample_paths)
+    ]
     if uncached_indices:
-        encoded = model.encode_slice_tokens(images[uncached_indices], slice_batch_size=slice_batch_size)
-        for offset, sample_idx in enumerate(uncached_indices):
-            sample_paths = cache_files[sample_idx]
-            for slice_offset, cache_file in enumerate(sample_paths):
-                cache_file.parent.mkdir(parents=True, exist_ok=True)
-                sample_cache = {
-                    "cls_tokens": encoded["cls_tokens"][offset : offset + 1, slice_offset : slice_offset + 1].detach().cpu(),
-                    "patch_tokens": encoded["patch_tokens"][offset : offset + 1, :, :, :, slice_offset : slice_offset + 1].detach().cpu(),
-                    "register_tokens": encoded["register_tokens"][offset : offset + 1, :, :, slice_offset : slice_offset + 1].detach().cpu(),
-                }
-                torch.save(sample_cache, cache_file)
+        uncached_views = []
+        for sample_idx in uncached_indices:
+            uncached_views.append(model.modality_views(images[sample_idx : sample_idx + 1]))
+        flat_uncached = torch.cat(uncached_views, dim=0)
+        encoded = model.encode_slice_tokens(flat_uncached, slice_batch_size=slice_batch_size)
+        offset = 0
+        for sample_idx in uncached_indices:
+            sample_modalities = cache_files[sample_idx]
+            for sample_paths in sample_modalities:
+                for slice_offset, cache_file in enumerate(sample_paths):
+                    cache_file.parent.mkdir(parents=True, exist_ok=True)
+                    sample_cache = {
+                        "cls_tokens": encoded["cls_tokens"][offset : offset + 1, slice_offset : slice_offset + 1].detach().cpu(),
+                        "patch_tokens": encoded["patch_tokens"][offset : offset + 1, :, :, :, slice_offset : slice_offset + 1].detach().cpu(),
+                        "register_tokens": encoded["register_tokens"][offset : offset + 1, :, :, slice_offset : slice_offset + 1].detach().cpu(),
+                    }
+                    torch.save(sample_cache, cache_file)
+                offset += 1
 
-    cached = [_load_cached_slices(sample_paths, device) for sample_paths in cache_files]
+    cached = []
+    for sample_modalities in cache_files:
+        cached.extend(_load_cached_slices(sample_paths, device) for sample_paths in sample_modalities)
     return None, _prepare_cached_batch(cached)
 
 
@@ -658,7 +822,12 @@ def evaluate(
                 slice_batch_size=slice_batch_size,
             )
             y = batch["label"].view(-1).to(device)
-            logits = model(x, slice_batch_size=slice_batch_size, cached_features=cached_features)
+            if args.modality_pool == "each":
+                num_modalities = int(batch["image"].shape[1])
+                logits_each = model(x, slice_batch_size=slice_batch_size, cached_features=cached_features)
+                logits = _pool_logits_across_modalities(logits_each, batch_size=y.numel(), num_modalities=num_modalities)
+            else:
+                logits = model(x, slice_batch_size=slice_batch_size, cached_features=cached_features)
             loss = loss_fn(logits, y)
             total_loss += float(loss.item()) * y.numel()
             n_seen += y.numel()
@@ -681,10 +850,36 @@ def run_one_task(args: argparse.Namespace, task: str) -> None:
     n_classes = int(metadata["metadata"]["n_classes"])
     split_files = load_split_files(task_dir, args.train_split, args.test_split, args.fold)
     resize_hw = _parse_hw_resize(args.resize_hw)
+    target_spacing_xy = _parse_spacing_xy(args.target_spacing_xy)
+    pad_hw = _parse_hw_resize(args.pad_hw)
 
-    train_ds = FOMOClsRegDataset(split_files.train, resize_hw=resize_hw)
-    val_ds = FOMOClsRegDataset(split_files.val, resize_hw=resize_hw)
-    test_ds = FOMOClsRegDataset(split_files.test, resize_hw=resize_hw)
+    train_ds = FOMOClsRegDataset(
+        split_files.train,
+        resize_hw=resize_hw,
+        target_spacing_xy=target_spacing_xy,
+        pad_hw=pad_hw,
+        mri_normalization=args.mri_normalization,
+        mri_low_percentile=args.mri_low_percentile,
+        mri_high_percentile=args.mri_high_percentile,
+    )
+    val_ds = FOMOClsRegDataset(
+        split_files.val,
+        resize_hw=resize_hw,
+        target_spacing_xy=target_spacing_xy,
+        pad_hw=pad_hw,
+        mri_normalization=args.mri_normalization,
+        mri_low_percentile=args.mri_low_percentile,
+        mri_high_percentile=args.mri_high_percentile,
+    )
+    test_ds = FOMOClsRegDataset(
+        split_files.test,
+        resize_hw=resize_hw,
+        target_spacing_xy=target_spacing_xy,
+        pad_hw=pad_hw,
+        mri_normalization=args.mri_normalization,
+        mri_low_percentile=args.mri_low_percentile,
+        mri_high_percentile=args.mri_high_percentile,
+    )
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
@@ -724,7 +919,9 @@ def run_one_task(args: argparse.Namespace, task: str) -> None:
     )
     print(
         f"slice_pool={args.slice_pool} modality_pool={args.modality_pool} "
-        f"resize_hw={resize_hw} slice_size={args.slice_size} max_slices={args.max_slices}"
+        f"spacing_xy={target_spacing_xy} pad_hw={pad_hw} resize_hw={resize_hw} "
+        f"slice_size={args.slice_size} max_slices={args.max_slices} "
+        f"mri_norm={args.mri_normalization}[{args.mri_low_percentile},{args.mri_high_percentile}]"
     )
 
     for epoch in range(args.epochs):
@@ -744,8 +941,13 @@ def run_one_task(args: argparse.Namespace, task: str) -> None:
                 slice_batch_size=args.slice_batch_size,
             )
             y = batch["label"].view(-1).to(device)
-            logits = model(x, slice_batch_size=args.slice_batch_size, cached_features=cached_features)
-            loss = loss_fn(logits, y)
+            if args.modality_pool == "each":
+                num_modalities = int(batch["image"].shape[1])
+                logits = model(x, slice_batch_size=args.slice_batch_size, cached_features=cached_features)
+                loss = loss_fn(logits, _repeat_labels_for_modalities(y, num_modalities))
+            else:
+                logits = model(x, slice_batch_size=args.slice_batch_size, cached_features=cached_features)
+                loss = loss_fn(logits, y)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -805,11 +1007,16 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--resize_hw", default=None, help="Resize only H,W as 'H,W'; Z is never resized.")
+    parser.add_argument("--target_spacing_xy", default=None, help="Optional X,Y spacing in mm as 'X,Y' before padding/resizing.")
+    parser.add_argument("--pad_hw", default=None, help="Optional zero-pad target H,W as 'H,W' after respacing.")
     parser.add_argument("--slice_size", type=int, default=512)
     parser.add_argument("--slice_axis", type=int, default=-1, help="Slice axis in [B,C,H,W,D]; default -1 means D.")
     parser.add_argument("--max_slices", type=int, default=None, help="Keep all slices by default; optionally subsample to this many slices.")
     parser.add_argument("--patch_size", type=int, default=8)
     parser.add_argument("--modality_pool", default="mean", choices=["mean", "first", "each"])
+    parser.add_argument("--mri_normalization", choices=["robust_zscore", "robust_minmax", "none"], default="robust_zscore")
+    parser.add_argument("--mri_low_percentile", type=float, default=0.5)
+    parser.add_argument("--mri_high_percentile", type=float, default=99.5)
     parser.add_argument("--slice_pool", default="attention", choices=["mean", "max", "attention", "transformer", "patch", "cls", "patch_cls"])
     parser.add_argument("--transformer_depth", type=int, default=2)
     parser.add_argument("--transformer_heads", type=int, default=8)
