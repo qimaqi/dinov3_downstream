@@ -30,7 +30,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.metrics import balanced_accuracy_score, roc_auc_score
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
 from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -44,11 +44,29 @@ DEFAULT_PROCESSED_ROOT = (
     "/usr/bmicnas02/data-biwi-01/qimaqi_data/workspace/medical_journal/"
     "FOMO_Challenge/processed_data"
 )
+DEFAULT_RAW_ROOT = (
+    "/usr/bmicnas02/data-biwi-01/bmicdatasets-originals/Originals/Challenge_Datasets/FOMO_Tasks"
+)
 DEFAULT_OUTPUT_DIR = str(ROOT / "results" / "3d_classify" / "fomo_slice_cls")
 DEFAULT_TASKS = ["CLS002_FOMO26_Infarct", "CLS003_FOMO26_Polymicrogyria"]
 DEFAULT_SPLIT = "split_80_10_10"
 DEFAULT_TEST_SPLIT = "TEST_80_10_10"
 SEED = 42
+
+RAW_TASK_CONFIG = {
+    "CLS002_FOMO26_Infarct": {
+        "image_root": Path(DEFAULT_RAW_ROOT) / "Task_1" / "Task_1" / "preprocessed",
+        "label_root": Path(DEFAULT_RAW_ROOT) / "Task_1" / "Task_1" / "labels",
+        "modalities": ("flair.nii.gz", "adc.nii.gz", "dwi_b1000.nii.gz"),
+        "label_file": "label.txt",
+    },
+    "CLS003_FOMO26_Polymicrogyria": {
+        "image_root": Path(DEFAULT_RAW_ROOT) / "Task_5" / "preprocessed",
+        "label_root": Path(DEFAULT_RAW_ROOT) / "Task_5" / "labels",
+        "modalities": ("t1.nii.gz",),
+        "label_file": "labels.txt",
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -214,6 +232,115 @@ def pad_volume_chwd(image: torch.Tensor, target_hw: tuple[int, int] | None) -> t
     return image_dhw.permute(0, 2, 3, 1).contiguous()
 
 
+def center_crop_or_pad_volume_chwd(image: torch.Tensor, target_hw: tuple[int, int] | None) -> torch.Tensor:
+    if target_hw is None:
+        return image
+    target_h, target_w = target_hw
+    height, width = image.shape[1:3]
+    start_h = max((height - target_h) // 2, 0)
+    start_w = max((width - target_w) // 2, 0)
+    end_h = start_h + min(height, target_h)
+    end_w = start_w + min(width, target_w)
+    cropped = image[:, start_h:end_h, start_w:end_w, :]
+    crop_h, crop_w = cropped.shape[1:3]
+    if crop_h == target_h and crop_w == target_w:
+        return cropped
+    pad_h = target_h - crop_h
+    pad_w = target_w - crop_w
+    top = pad_h // 2
+    bottom = pad_h - top
+    left = pad_w // 2
+    right = pad_w - left
+    cropped_dhw = cropped.permute(0, 3, 1, 2)
+    cropped_dhw = F.pad(cropped_dhw, (left, right, top, bottom))
+    return cropped_dhw.permute(0, 2, 3, 1).contiguous()
+
+
+def _import_sitk():
+    try:
+        import SimpleITK as sitk
+    except ImportError as exc:
+        raise RuntimeError("SimpleITK is required for raw FOMO .nii.gz loading.") from exc
+    return sitk
+
+
+def _resolve_raw_sample_paths(task: str, split_path: str, raw_root: str | None) -> tuple[list[Path], Path]:
+    config = RAW_TASK_CONFIG[task]
+    split_file = Path(split_path)
+    subject = split_file.parents[1].name
+    session = split_file.parents[0].name
+    if raw_root is None:
+        image_root = config["image_root"]
+        label_root = config["label_root"]
+    else:
+        base_root = Path(raw_root)
+        image_root = base_root / config["image_root"].relative_to(DEFAULT_RAW_ROOT)
+        label_root = base_root / config["label_root"].relative_to(DEFAULT_RAW_ROOT)
+    image_paths = [image_root / subject / session / modality for modality in config["modalities"]]
+    label_path = label_root / subject / session / config["label_file"]
+    return image_paths, label_path
+
+
+def _load_raw_volume_chwd(image_paths: list[Path], target_spacing_xy: tuple[float, float] | None) -> torch.Tensor:
+    sitk = _import_sitk()
+    channels: list[torch.Tensor] = []
+    for image_path in image_paths:
+        image = sitk.ReadImage(str(image_path))
+        oriented = sitk.DICOMOrient(image, "RAS")
+        original_spacing = tuple(float(v) for v in oriented.GetSpacing())
+        if target_spacing_xy is not None:
+            target_spacing = (float(target_spacing_xy[0]), float(target_spacing_xy[1]), original_spacing[2])
+            original_size = oriented.GetSize()
+            new_size = [
+                max(1, int(round(size * spacing / target)))
+                for size, spacing, target in zip(original_size, original_spacing, target_spacing)
+            ]
+            resampler = sitk.ResampleImageFilter()
+            resampler.SetOutputSpacing(target_spacing)
+            resampler.SetSize(new_size)
+            resampler.SetOutputDirection(oriented.GetDirection())
+            resampler.SetOutputOrigin(oriented.GetOrigin())
+            resampler.SetTransform(sitk.Transform())
+            resampler.SetDefaultPixelValue(0.0)
+            resampler.SetInterpolator(sitk.sitkLinear)
+            oriented = resampler.Execute(oriented)
+        array_zyx = sitk.GetArrayFromImage(oriented).astype(np.float32, copy=False)
+        channels.append(torch.from_numpy(np.transpose(array_zyx, (1, 2, 0))).contiguous())
+    return torch.stack(channels, dim=0)
+
+
+def _load_raw_label(label_path: Path) -> torch.Tensor:
+    return torch.tensor(int(label_path.read_text().strip()), dtype=torch.long)
+
+
+def save_debug_slice_image(batch: dict[str, object], output_path: Path) -> None:
+    if output_path.exists():
+        return
+    image = batch["image"]
+    if not isinstance(image, torch.Tensor):
+        return
+    volume = image[0]
+    channel = volume[0]
+    mid_slice = channel[:, :, channel.shape[-1] // 2].detach().cpu().float().numpy()
+    finite_mask = np.isfinite(mid_slice)
+    if not finite_mask.any():
+        mid_slice = np.zeros_like(mid_slice, dtype=np.uint8)
+    else:
+        values = mid_slice[finite_mask]
+        lo = float(values.min())
+        hi = float(values.max())
+        if hi <= lo:
+            mid_slice = np.zeros_like(mid_slice, dtype=np.uint8)
+        else:
+            mid_slice = np.clip((mid_slice - lo) / (hi - lo), 0.0, 1.0)
+            mid_slice = (mid_slice * 255.0).astype(np.uint8)
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError("Pillow is required to save debug validation slice images.") from exc
+    Image.fromarray(mid_slice, mode="L").save(output_path)
+
+
 def normalize_volume_chwd(
     image: torch.Tensor,
     method: str,
@@ -223,6 +350,7 @@ def normalize_volume_chwd(
     if method == "none":
         return torch.nan_to_num(image).float()
 
+    max_quantile_values = 2_000_000
     out_channels = []
     for channel_idx in range(image.shape[0]):
         channel = image[channel_idx]
@@ -230,8 +358,12 @@ def normalize_volume_chwd(
         if values.numel() < 16:
             out_channels.append(torch.nan_to_num(channel).float())
             continue
-        lo = torch.quantile(values, low_percentile / 100.0)
-        hi = torch.quantile(values, high_percentile / 100.0)
+        quantile_values = values
+        if values.numel() > max_quantile_values:
+            step = max(1, values.numel() // max_quantile_values)
+            quantile_values = values[::step]
+        lo = torch.quantile(quantile_values, low_percentile / 100.0)
+        hi = torch.quantile(quantile_values, high_percentile / 100.0)
         clipped = channel.clamp(min=lo.item(), max=hi.item())
         if method == "robust_minmax":
             denom = max(float((hi - lo).item()), 1e-6)
@@ -248,11 +380,13 @@ def normalize_volume_chwd(
 
 
 class FOMOClsRegDataset(Dataset):
-    """Asparagus-style classification dataset reader for processed FOMO .pt files."""
+    """Classification dataset reader that loads raw FOMO NIfTI volumes on demand."""
 
     def __init__(
         self,
+        task: str,
         files: Iterable[str],
+        raw_root: str | None = None,
         resize_hw: tuple[int, int] | None = None,
         target_spacing_xy: tuple[float, float] | None = None,
         pad_hw: tuple[int, int] | None = None,
@@ -260,7 +394,9 @@ class FOMOClsRegDataset(Dataset):
         mri_low_percentile: float = 0.5,
         mri_high_percentile: float = 99.5,
     ):
+        self.task = task
         self.files = list(files)
+        self.raw_root = raw_root
         self.resize_hw = resize_hw
         self.target_spacing_xy = target_spacing_xy
         self.pad_hw = pad_hw
@@ -273,10 +409,10 @@ class FOMOClsRegDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, object]:
         path = self.files[index]
-        sample = torch.load(path, map_location="cpu")
-        image, label = _as_image_label(sample, path)
-        image = respace_xy_volume_chwd(image, _load_spacing_metadata(path), self.target_spacing_xy)
-        image = pad_volume_chwd(image, self.pad_hw)
+        image_paths, label_path = _resolve_raw_sample_paths(self.task, path, self.raw_root)
+        image = _load_raw_volume_chwd(image_paths, self.target_spacing_xy)
+        label = _load_raw_label(label_path)
+        image = center_crop_or_pad_volume_chwd(image, self.pad_hw)
         image = resize_volume_chwd(image, self.resize_hw)
         image = normalize_volume_chwd(
             image,
@@ -285,7 +421,7 @@ class FOMOClsRegDataset(Dataset):
             high_percentile=self.mri_high_percentile,
         )
         return {
-            "file_path": path,
+            "file_path": str(image_paths[0]),
             "image": image,
             "label": label,
         }
@@ -377,15 +513,16 @@ def _cache_file_name(
     source_path: str,
     slice_axis: int,
     max_slices: int | None,
-    slice_size: int,
+    slice_size: int | None,
     patch_size: int,
     modality_pool: str,
     resize_hw: tuple[int, int] | None,
     slice_id: int | None = None,
 ) -> str:
     resize_tag = "orig" if resize_hw is None else f"{resize_hw[0]}x{resize_hw[1]}"
+    slice_size_tag = "none" if slice_size is None else str(slice_size)
     signature = (
-        f"{Path(source_path).stem}|axis={slice_axis}|max={max_slices}|slice={slice_size}|"
+        f"{Path(source_path).stem}|axis={slice_axis}|max={max_slices}|slice={slice_size_tag}|"
         f"patch={patch_size}|modality={modality_pool}|resize={resize_tag}"
     )
     digest = hashlib.md5(signature.encode("utf-8")).hexdigest()[:12]
@@ -397,7 +534,7 @@ def _cache_file_name(
 def _cache_subject_dir_name(source_path: str) -> str:
     path = Path(source_path)
     for parent in path.parents:
-        if parent.name.startswith("sub-"):
+        if parent.name.startswith(("sub-", "sub_")):
             return parent.name
     if path.parent.name:
         return path.parent.name
@@ -440,7 +577,7 @@ class FlexiCTSliceVolumeClassifier(nn.Module):
         slice_pool: str,
         modality_pool: str,
         slice_axis: int,
-        slice_size: int,
+        slice_size: int | None,
         patch_size: int,
         max_slices: int | None,
         encoder_tuning: str,
@@ -475,7 +612,8 @@ class FlexiCTSliceVolumeClassifier(nn.Module):
         self.freeze_encoder = encoder_tuning == "frozen"
         self.slice_pool_name = slice_pool
 
-        probe = torch.zeros(1, 1, slice_size, slice_size, device=device)
+        probe_size = slice_size or 256
+        probe = torch.zeros(1, 1, probe_size, probe_size, device=device)
         with torch.no_grad():
             probe_out = self.encoder(probe)
             self.token_dim = int(probe_out["cls_token"].shape[-1])
@@ -598,7 +736,8 @@ class FlexiCTSliceVolumeClassifier(nn.Module):
 
         batch, n_slices, channels, height, width = slices.shape
         flat = slices.view(batch * n_slices, channels, height, width)
-        flat = F.interpolate(flat, size=(self.slice_size, self.slice_size), mode="bilinear", align_corners=False)
+        if self.slice_size is not None:
+            flat = F.interpolate(flat, size=(self.slice_size, self.slice_size), mode="bilinear", align_corners=False)
         flat = self._normalize_slices(flat)
 
         encoded_batches = []
@@ -650,6 +789,14 @@ def _repeat_labels_for_modalities(labels: torch.Tensor, num_modalities: int) -> 
 
 def _pool_logits_across_modalities(logits: torch.Tensor, batch_size: int, num_modalities: int) -> torch.Tensor:
     return logits.view(batch_size, num_modalities, -1).mean(dim=1)
+
+
+def _reshape_logits_by_modality(
+    logits: torch.Tensor,
+    batch_size: int,
+    num_modalities: int,
+) -> torch.Tensor:
+    return logits.view(batch_size, num_modalities, -1)
 
 
 def _prepare_cached_batch(cached_list: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
@@ -804,6 +951,7 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
     slice_batch_size: int,
+    debug_image_path: Path | None = None,
 ) -> dict[str, float]:
     model.eval()
     probs = []
@@ -811,8 +959,14 @@ def evaluate(
     total_loss = 0.0
     n_seen = 0
     loss_fn = nn.CrossEntropyLoss()
+    fused_correct = 0
+    per_modality_correct: list[int] | None = None
+    debug_saved = debug_image_path is None
     with torch.no_grad():
         for batch in loader:
+            if not debug_saved and debug_image_path is not None:
+                save_debug_slice_image(batch, debug_image_path)
+                debug_saved = True
             x, cached_features = maybe_load_or_create_cached_features(
                 args=args,
                 task=task,
@@ -825,22 +979,40 @@ def evaluate(
             if args.modality_pool == "each":
                 num_modalities = int(batch["image"].shape[1])
                 logits_each = model(x, slice_batch_size=slice_batch_size, cached_features=cached_features)
-                logits = _pool_logits_across_modalities(logits_each, batch_size=y.numel(), num_modalities=num_modalities)
+                logits_each = _reshape_logits_by_modality(
+                    logits_each,
+                    batch_size=y.numel(),
+                    num_modalities=num_modalities,
+                )
+                logits = logits_each.mean(dim=1)
+                pred_each = logits_each.argmax(dim=-1)
+                if per_modality_correct is None:
+                    per_modality_correct = [0 for _ in range(num_modalities)]
+                for modality_idx in range(num_modalities):
+                    per_modality_correct[modality_idx] += int(
+                        (pred_each[:, modality_idx] == y).sum().item()
+                    )
             else:
                 logits = model(x, slice_batch_size=slice_batch_size, cached_features=cached_features)
             loss = loss_fn(logits, y)
             total_loss += float(loss.item()) * y.numel()
             n_seen += y.numel()
+            fused_correct += int((logits.argmax(dim=-1) == y).sum().item())
             probs.append(torch.softmax(logits, dim=-1).cpu().numpy())
             labels.append(y.cpu().numpy())
     proba = np.concatenate(probs, axis=0)
     y_true = np.concatenate(labels, axis=0)
     y_pred = proba.argmax(axis=1)
-    return {
+    metrics = {
         "loss": total_loss / max(1, n_seen),
         "auc": _auc(proba, y_true),
         "bal_acc": float(balanced_accuracy_score(y_true, y_pred)),
+        "accuracy_fused": fused_correct / max(1, n_seen),
     }
+    if per_modality_correct is not None:
+        for modality_idx, correct in enumerate(per_modality_correct):
+            metrics[f"accuracy_modality_{modality_idx}"] = correct / max(1, n_seen)
+    return metrics
 
 
 def run_one_task(args: argparse.Namespace, task: str) -> None:
@@ -851,10 +1023,16 @@ def run_one_task(args: argparse.Namespace, task: str) -> None:
     split_files = load_split_files(task_dir, args.train_split, args.test_split, args.fold)
     resize_hw = _parse_hw_resize(args.resize_hw)
     target_spacing_xy = _parse_spacing_xy(args.target_spacing_xy)
+    if target_spacing_xy is None:
+        target_spacing_xy = (1.0, 1.0)
     pad_hw = _parse_hw_resize(args.pad_hw)
+    if pad_hw is None:
+        pad_hw = (256, 256)
 
     train_ds = FOMOClsRegDataset(
+        task,
         split_files.train,
+        raw_root=args.raw_root,
         resize_hw=resize_hw,
         target_spacing_xy=target_spacing_xy,
         pad_hw=pad_hw,
@@ -863,7 +1041,9 @@ def run_one_task(args: argparse.Namespace, task: str) -> None:
         mri_high_percentile=args.mri_high_percentile,
     )
     val_ds = FOMOClsRegDataset(
+        task,
         split_files.val,
+        raw_root=args.raw_root,
         resize_hw=resize_hw,
         target_spacing_xy=target_spacing_xy,
         pad_hw=pad_hw,
@@ -872,7 +1052,9 @@ def run_one_task(args: argparse.Namespace, task: str) -> None:
         mri_high_percentile=args.mri_high_percentile,
     )
     test_ds = FOMOClsRegDataset(
+        task,
         split_files.test,
+        raw_root=args.raw_root,
         resize_hw=resize_hw,
         target_spacing_xy=target_spacing_xy,
         pad_hw=pad_hw,
@@ -884,6 +1066,14 @@ def run_one_task(args: argparse.Namespace, task: str) -> None:
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    final_eval_loader = DataLoader(
+        ConcatDataset([val_ds, test_ds]),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+    )
+    output_dir = Path(args.output_dir) / task / f"fold_{args.fold}"
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     model = FlexiCTSliceVolumeClassifier(
         checkpoint=args.checkpoint,
@@ -912,6 +1102,7 @@ def run_one_task(args: argparse.Namespace, task: str) -> None:
     loss_fn = nn.CrossEntropyLoss()
     best_val_loss = math.inf
     best_state = None
+    best_epoch = 0
 
     print(
         f"\nTask={task} train={len(train_ds)} val={len(val_ds)} test={len(test_ds)} "
@@ -957,44 +1148,93 @@ def run_one_task(args: argparse.Namespace, task: str) -> None:
             n_seen += y.numel()
             progress.set_postfix(loss=train_loss / max(1, n_seen))
 
-        val_metrics = evaluate(args, task, model, val_loader, device=device, slice_batch_size=args.slice_batch_size)
-        print(
+        val_metrics = evaluate(
+            args,
+            task,
+            model,
+            val_loader,
+            device=device,
+            slice_batch_size=args.slice_batch_size,
+            debug_image_path=output_dir / "val_debug_slice.png",
+        )
+        val_message = (
             f"epoch={epoch + 1:03d} train_loss={train_loss / max(1, n_seen):.4f} "
             f"val_loss={val_metrics['loss']:.4f} val_auc={val_metrics['auc']:.4f} "
-            f"val_bal_acc={val_metrics['bal_acc']:.4f}"
+            f"val_bal_acc={val_metrics['bal_acc']:.4f} val_acc_fused={val_metrics['accuracy_fused']:.4f}"
         )
+        if args.modality_pool == "each":
+            per_modality_parts = []
+            modality_idx = 0
+            while f"accuracy_modality_{modality_idx}" in val_metrics:
+                per_modality_parts.append(
+                    f"val_acc_m{modality_idx}={val_metrics[f'accuracy_modality_{modality_idx}']:.4f}"
+                )
+                modality_idx += 1
+            if per_modality_parts:
+                val_message += " " + " ".join(per_modality_parts)
+        print(val_message)
         if val_metrics["loss"] < best_val_loss:
             best_val_loss = val_metrics["loss"]
             best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            best_epoch = epoch + 1
 
     if best_state is not None:
         model.load_state_dict(best_state)
     test_metrics = evaluate(args, task, model, test_loader, device=device, slice_batch_size=args.slice_batch_size)
-    print(
-        f"[test] {task} loss={test_metrics['loss']:.4f} auc={test_metrics['auc']:.4f} "
-        f"bal_acc={test_metrics['bal_acc']:.4f}"
+    final_metrics = evaluate(
+        args,
+        task,
+        model,
+        final_eval_loader,
+        device=device,
+        slice_batch_size=args.slice_batch_size,
     )
+    test_message = (
+        f"[final val+test] {task} loss={final_metrics['loss']:.4f} auc={final_metrics['auc']:.4f} "
+        f"bal_acc={final_metrics['bal_acc']:.4f} acc_fused={final_metrics['accuracy_fused']:.4f}"
+    )
+    if args.modality_pool == "each":
+        per_modality_parts = []
+        modality_idx = 0
+        while f"accuracy_modality_{modality_idx}" in final_metrics:
+            per_modality_parts.append(
+                f"acc_m{modality_idx}={final_metrics[f'accuracy_modality_{modality_idx}']:.4f}"
+            )
+            modality_idx += 1
+        if per_modality_parts:
+            test_message += " " + " ".join(per_modality_parts)
+    print(test_message)
 
-    output_dir = Path(args.output_dir) / task / f"fold_{args.fold}"
-    output_dir.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "model": model.state_dict(),
             "args": vars(args),
             "task": task,
+            "best_epoch": best_epoch,
             "best_val_loss": best_val_loss,
             "test_metrics": test_metrics,
+            "final_metrics": final_metrics,
         },
         output_dir / "best.pt",
     )
     with open(output_dir / "metrics.json", "w", encoding="utf-8") as f:
-        json.dump({"best_val_loss": best_val_loss, "test": test_metrics}, f, indent=2)
+        json.dump(
+            {
+                "best_epoch": best_epoch,
+                "best_val_loss": best_val_loss,
+                "test": test_metrics,
+                "final_val_test": final_metrics,
+            },
+            f,
+            indent=2,
+        )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task", default="all", choices=[*DEFAULT_TASKS, "all"])
     parser.add_argument("--processed_root", default=DEFAULT_PROCESSED_ROOT)
+    parser.add_argument("--raw_root", default=DEFAULT_RAW_ROOT)
     parser.add_argument("--train_split", default=DEFAULT_SPLIT)
     parser.add_argument("--test_split", default=DEFAULT_TEST_SPLIT)
     parser.add_argument("--fold", type=int, default=0)
@@ -1009,7 +1249,7 @@ def main() -> None:
     parser.add_argument("--resize_hw", default=None, help="Resize only H,W as 'H,W'; Z is never resized.")
     parser.add_argument("--target_spacing_xy", default=None, help="Optional X,Y spacing in mm as 'X,Y' before padding/resizing.")
     parser.add_argument("--pad_hw", default=None, help="Optional zero-pad target H,W as 'H,W' after respacing.")
-    parser.add_argument("--slice_size", type=int, default=512)
+    parser.add_argument("--slice_size", type=int, default=None)
     parser.add_argument("--slice_axis", type=int, default=-1, help="Slice axis in [B,C,H,W,D]; default -1 means D.")
     parser.add_argument("--max_slices", type=int, default=None, help="Keep all slices by default; optionally subsample to this many slices.")
     parser.add_argument("--patch_size", type=int, default=8)

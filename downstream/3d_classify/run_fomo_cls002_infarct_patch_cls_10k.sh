@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=run_fomo_cls002_infarct_patch_cls
-#SBATCH --output=sbatch_log/run_fomo_cls002_infarct_patch_cls_%j.out
+#SBATCH --job-name=run_fomo_cls002_infarct_patch_cls_10k
+#SBATCH --output=sbatch_log/run_fomo_cls002_infarct_patch_cls_10k_%j.out
 #SBATCH --nodes=1
 #SBATCH --time=24:00:00
 #SBATCH --gres=gpu:1
@@ -19,17 +19,19 @@ PROCESSED_ROOT="/usr/bmicnas02/data-biwi-01/qimaqi_data/workspace/medical_journa
 TASK_NAME="CLS002_FOMO26_Infarct"
 TRAIN_SPLIT="${TRAIN_SPLIT:-split_v0_repeat10_val4_balanced}"
 TEST_SPLIT="${TEST_SPLIT:-TEST_split_v0_4cases_balanced}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/results/3d_classify/fomo_slice_cls_each_robust_zscore_split_v0_repeat10_val4}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/results/3d_classify/fomo_slice_cls_each_robust_zscore_split_v0_repeat10_val4_10k}"
 
 # export FLEXICT_2D_CHECKPOINT="/usr/bmicnas02/data-biwi-01/qimaqi_data/workspace/medical_journal/FlexiCT/ckpts/2D_final_model.pth"
-export FLEXICT_2D_CHECKPOINT=/usr/bmicnas02/data-biwi-01/qimaqi_data/workspace/medical_journal/FlexiCT_downstream/FlexiCT/ckpts/pretrain_fomo_100k_pretrained_flexcit_base_g8_e200_p8_mri_gram/2D_final_model_fomo100k_gram.pth
+export FLEXICT_2D_CHECKPOINT=/usr/bmicnas03/data-biwi-01/qimaqi_data/data/medical_journal/flexcit_outputs/leomed/pretrain_fomo_10k_pretrained_flexcit_base_g8_e200_p8_mri//2D_final_model.pth
 
-# /usr/bmicnas03/data-biwi-01/qimaqi_data/data/medical_journal/flexcit_outputs/leomed/pretrain_fomo_10k_pretrained_flexcit_base_g8_e200_p8_mri//2D_final_model.pth
+
+# /usr/bmicnas02/data-biwi-01/qimaqi_data/workspace/medical_journal/FlexiCT_downstream/FlexiCT/ckpts/pretrain_fomo_100k_pretrained_flexcit_base_g8_e200_p8_mri_gram/2D_final_model_fomo100k_gram.pth
+
+# 
 export FLEXICT_3D_CHECKPOINT=/usr/bmicnas02/data-biwi-01/qimaqi_data/workspace/medical_journal/FlexiCT_downstream/FlexiCT/ckpts/pretrain_fomo_100k_pretrained_flexcit_base_g8_e200_p8_mri_gram/2D_final_model_fomo100k_gram.pth
 
 # /usr/bmicnas03/data-biwi-01/qimaqi_data/data/medical_journal/flexcit_outputs/leomed/pretrain_fomo_10k_pretrained_flexcit_base_g8_e200_p8_mri//3D_final_model.pth
-
-export FOMO_CACHE_ROOT="${FOMO_CACHE_ROOT:-${PROCESSED_ROOT}/${TASK_NAME}/pretrain_fomo_100k_pretrained_flexcit_base_g8_e200_p8_mri_gram}/"
+export FOMO_CACHE_ROOT="${FOMO_CACHE_ROOT:-${PROCESSED_ROOT}/${TASK_NAME}/preprocessed_pretrain_fomo_10k_pretrained_flexcit_base_g8_e200_p8_mri}/"
 
 cd "${REPO_ROOT}"
 mkdir -p "${FOMO_CACHE_ROOT}"
