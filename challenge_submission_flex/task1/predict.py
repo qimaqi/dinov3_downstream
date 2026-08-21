@@ -63,57 +63,97 @@ if str(REPO_ROOT) not in sys.path:
 # ============================================================================
 # MODEL WEIGHT PATHS
 # ============================================================================
-DEFAULT_RESULTS_DIR = (
-    REPO_ROOT
-    / "results"
-    / "3d_classify"
-    / "fomo_slice_cls_each_robust_zscore"
-    / "CLS002_FOMO26_Infarct"
-)
-SELECTED_FOLDS = ("fold_0", "fold_4", "fold_1")
+BACKBONE_KIND = os.environ.get("TASK1_BACKBONE_KIND", "flex").strip().lower()
+if BACKBONE_KIND not in {"flex", "dinov3"}:
+    raise ValueError(
+        f"Unsupported TASK1_BACKBONE_KIND='{BACKBONE_KIND}'. Expected 'flex' or 'dinov3'."
+    )
+
+if BACKBONE_KIND == "dinov3":
+    DEFAULT_RESULTS_DIR = (
+        REPO_ROOT
+        / "results"
+        / "3d_classify"
+        / "dinov3_slice_cls_each_robust_zscore"
+        / "CLS002_FOMO26_Infarct"
+    )
+else:
+    DEFAULT_RESULTS_DIR = (
+        REPO_ROOT
+        / "results"
+        / "3d_classify"
+        / "fomo_slice_cls_each_robust_zscore"
+        / "CLS002_FOMO26_Infarct"
+    )
+_selected_folds_env = os.environ.get("TASK1_SELECTED_FOLDS")
+if _selected_folds_env:
+    SELECTED_FOLDS = tuple(
+        fold.strip() for fold in _selected_folds_env.split(",") if fold.strip()
+    )
+else:
+    SELECTED_FOLDS = ("fold_0", "fold_2", "fold_4")
 
 
 def _resolve_backbone_checkpoint() -> Path:
-    env_path = os.environ.get("FLEXICT_2D_CHECKPOINT")
+    env_var = "DINOV3_2D_CHECKPOINT" if BACKBONE_KIND == "dinov3" else "FLEXICT_2D_CHECKPOINT"
+    env_path = os.environ.get(env_var)
     if env_path:
         path = Path(env_path)
         if path.exists():
             return path
 
-    candidates = [
-        WEIGHTS_DIR / "2D_final_model_fomo100k_gram.pth",
-        WEIGHTS_DIR / "2D_final_model.pth",
-        REPO_ROOT
-        / "ckpts"
-        / "pretrain_fomo_100k_pretrained_flexcit_base_g8_e200_p8_mri_gram"
-        / "2D_final_model_fomo100k_gram.pth",
-    ]
+    if BACKBONE_KIND == "dinov3":
+        candidates = [
+            WEIGHTS_DIR / "2D_final_model.pth",
+            REPO_ROOT
+            / "ckpts"
+            / "pretrain_fomo_10k_pretrained_dinov3_dino_base_g8_e400_p16_mri_normalize"
+            / "2D_final_model.pth",
+        ]
+    else:
+        candidates = [
+            WEIGHTS_DIR / "2D_final_model_fomo100k_gram.pth",
+            WEIGHTS_DIR / "2D_final_model.pth",
+            REPO_ROOT
+            / "ckpts"
+            / "pretrain_fomo_100k_pretrained_flexcit_base_g8_e200_p8_mri_gram"
+            / "2D_final_model_fomo100k_gram.pth",
+        ]
     for path in candidates:
         if path.exists():
             return path
 
+    model_name = "DINOv3" if BACKBONE_KIND == "dinov3" else "FlexiCT"
     raise FileNotFoundError(
-        "Could not resolve the FlexiCT 2D backbone checkpoint. Checked:\n"
+        f"Could not resolve the {model_name} 2D backbone checkpoint. Checked:\n"
         + "\n".join(f"  - {p}" for p in candidates)
         + (
-            "\n  - $FLEXICT_2D_CHECKPOINT"
+            f"\n  - ${env_var}"
             if env_path
-            else "\nSet FLEXICT_2D_CHECKPOINT to a valid checkpoint path if needed."
+            else f"\nSet {env_var} to a valid checkpoint path if needed."
         )
     )
 
 
-FLEXICT_2D_CHECKPOINT_PATH = _resolve_backbone_checkpoint()
+BACKBONE_CHECKPOINT_PATH = _resolve_backbone_checkpoint()
 
-# Set env var so flexi_ct.checkpoints can resolve the backbone consistently.
-os.environ["FLEXICT_2D_CHECKPOINT"] = str(FLEXICT_2D_CHECKPOINT_PATH)
+# Keep the relevant env var set so the downstream loader resolves consistently.
+if BACKBONE_KIND == "dinov3":
+    os.environ["DINOV3_2D_CHECKPOINT"] = str(BACKBONE_CHECKPOINT_PATH)
+else:
+    os.environ["FLEXICT_2D_CHECKPOINT"] = str(BACKBONE_CHECKPOINT_PATH)
 
 # ─── Imports from repo ────────────────────────────────────────────────────────
 from flexi_ct import Flexi_CT_2D  # noqa: E402
 from flexi_ct.checkpoints import resolve_flexict_checkpoint  # noqa: E402
 
 # downstream/3d_classify starts with a digit, so use importlib
-_TRAIN_SCRIPT = REPO_ROOT / "downstream" / "3d_classify" / "fomo_finetune_cls_from_slices.py"
+if BACKBONE_KIND == "dinov3":
+    _TRAIN_SCRIPT = REPO_ROOT / "downstream" / "3d_classify" / "dinov3_finetune_cls_from_slices.py"
+    _TRAIN_MODULE_NAME = "dinov3_finetune_cls_from_slices"
+else:
+    _TRAIN_SCRIPT = REPO_ROOT / "downstream" / "3d_classify" / "fomo_finetune_cls_from_slices.py"
+    _TRAIN_MODULE_NAME = "fomo_finetune_cls_from_slices"
 
 
 def _load_module(script_path: Path, module_name: str):
@@ -122,14 +162,22 @@ def _load_module(script_path: Path, module_name: str):
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot load module from {script_path}")
     module = importlib.util.module_from_spec(spec)
-    # Register in sys.modules BEFORE exec so @dataclass can resolve the module
+    # Register the module before execution so decorators like @dataclass
+    # can resolve __module__ through sys.modules during import.
     sys.modules[module_name] = module
+    # Register in sys.modules BEFORE exec so @dataclass can resolve the module
+    # sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
 
 
-_TRAIN_MODULE = _load_module(_TRAIN_SCRIPT, "fomo_finetune_cls_from_slices")
+_TRAIN_MODULE = _load_module(_TRAIN_SCRIPT, _TRAIN_MODULE_NAME)
 FlexiCTSliceVolumeClassifier = _TRAIN_MODULE.FlexiCTSliceVolumeClassifier
+_parse_hw_resize = _TRAIN_MODULE._parse_hw_resize
+_parse_spacing_xy = _TRAIN_MODULE._parse_spacing_xy
+normalize_volume_chwd = _TRAIN_MODULE.normalize_volume_chwd
+pad_volume_chwd = _TRAIN_MODULE.pad_volume_chwd
+respace_xy_volume_chwd = _TRAIN_MODULE.respace_xy_volume_chwd
 resize_volume_chwd = _TRAIN_MODULE.resize_volume_chwd
 
 
@@ -147,17 +195,22 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_nifti(path: str) -> np.ndarray:
-    """Load a NIfTI image and return as float32 numpy array."""
+def load_nifti(path: str) -> tuple[np.ndarray, tuple[float, float] | None]:
+    """Load a NIfTI image and return data plus in-plane spacing (X, Y)."""
     import nibabel as nib
 
-    data = nib.load(path).get_fdata(dtype=np.float32)
+    nii = nib.load(path)
+    data = nii.get_fdata(dtype=np.float32)
     if data.ndim != 3:
         raise ValueError(f"Expected a 3D image at {path}, got shape {data.shape}")
-    return data
+    zooms = nii.header.get_zooms()
+    spacing_xy = None
+    if len(zooms) >= 2:
+        spacing_xy = (float(zooms[0]), float(zooms[1]))
+    return data, spacing_xy
 
 
-def collect_modalities(args: argparse.Namespace) -> torch.Tensor:
+def collect_modalities(args: argparse.Namespace) -> tuple[torch.Tensor, list[tuple[float, float] | None]]:
     """Stack available modalities into a single [C, H, W, D] tensor."""
     modality_paths = [
         ("flair", args.flair),
@@ -168,11 +221,12 @@ def collect_modalities(args: argparse.Namespace) -> torch.Tensor:
     ]
 
     arrays = []
+    spacings_xy = []
     reference_shape = None
     for name, path in modality_paths:
         if path is None:
             continue
-        arr = load_nifti(path)
+        arr, spacing_xy = load_nifti(path)
         if reference_shape is None:
             reference_shape = arr.shape
         elif arr.shape != reference_shape:
@@ -181,42 +235,96 @@ def collect_modalities(args: argparse.Namespace) -> torch.Tensor:
                 f"got {arr.shape} for modality '{name}'"
             )
         arrays.append(arr)
+        spacings_xy.append(spacing_xy)
 
     if not arrays:
         raise ValueError("At least one modality path must be provided.")
 
     # Stack to [C, H, W, D]
-    return torch.from_numpy(np.stack(arrays, axis=0))
+    return torch.from_numpy(np.stack(arrays, axis=0)), spacings_xy
+
+
+def preprocess_volume(
+    volume: torch.Tensor,
+    spacings_xy: list[tuple[float, float] | None],
+    saved_args: dict,
+) -> torch.Tensor:
+    """Match training-time volume preprocessing as closely as possible."""
+    resize_hw = _parse_hw_resize(saved_args.get("resize_hw"))
+    target_spacing_xy = _parse_spacing_xy(saved_args.get("target_spacing_xy"))
+    pad_hw = _parse_hw_resize(saved_args.get("pad_hw"))
+    mri_normalization = saved_args.get("mri_normalization", "robust_zscore")
+    mri_low_percentile = float(saved_args.get("mri_low_percentile", 0.5))
+    mri_high_percentile = float(saved_args.get("mri_high_percentile", 99.5))
+
+    processed_channels = []
+    for channel_idx in range(volume.shape[0]):
+        channel = volume[channel_idx : channel_idx + 1].clone()
+        channel = respace_xy_volume_chwd(channel, spacings_xy[channel_idx], target_spacing_xy)
+        channel = pad_volume_chwd(channel, pad_hw)
+        channel = resize_volume_chwd(channel, resize_hw)
+        channel = normalize_volume_chwd(
+            channel,
+            method=mri_normalization,
+            low_percentile=mri_low_percentile,
+            high_percentile=mri_high_percentile,
+        )
+        processed_channels.append(channel)
+    return torch.cat(processed_channels, dim=0)
 
 
 def build_model(ckpt: dict, device: torch.device) -> tuple:
-    """Reconstruct FlexiCTSliceVolumeClassifier from saved checkpoint."""
+    """Reconstruct the saved slice classifier from a checkpoint."""
     saved_args = ckpt["args"]
     task = ckpt.get("task", "CLS002_FOMO26_Infarct")
     num_classes = 2 if task == "CLS002_FOMO26_Infarct" else int(saved_args.get("num_classes", 2))
 
-    model = FlexiCTSliceVolumeClassifier(
-        checkpoint=str(FLEXICT_2D_CHECKPOINT_PATH),
-        num_classes=num_classes,
-        slice_pool=saved_args["slice_pool"],
-        modality_pool=saved_args["modality_pool"],
-        slice_axis=saved_args["slice_axis"],
-        slice_size=saved_args["slice_size"],
-        patch_size=saved_args["patch_size"],
-        max_slices=saved_args["max_slices"],
-        encoder_tuning="frozen",
-        lora_r=saved_args.get("lora_r", 16),
-        lora_alpha=saved_args.get("lora_alpha", 16),
-        lora_targets=[
-            s.strip()
-            for s in saved_args.get("lora_targets", "qkv,proj").split(",")
-            if s.strip()
-        ],
-        lora_dropout=saved_args.get("lora_dropout", 0.0),
-        transformer_depth=saved_args.get("transformer_depth", 2),
-        transformer_heads=saved_args.get("transformer_heads", 8),
-        device=device,
-    ).to(device)
+    if BACKBONE_KIND == "dinov3":
+        model = FlexiCTSliceVolumeClassifier(
+            dinov3_checkpoint=str(BACKBONE_CHECKPOINT_PATH),
+            num_classes=num_classes,
+            slice_pool=saved_args["slice_pool"],
+            modality_pool=saved_args["modality_pool"],
+            slice_axis=saved_args["slice_axis"],
+            slice_size=saved_args["slice_size"],
+            patch_size=saved_args["patch_size"],
+            max_slices=saved_args["max_slices"],
+            encoder_tuning="frozen",
+            lora_r=saved_args.get("lora_r", 16),
+            lora_alpha=saved_args.get("lora_alpha", 16),
+            lora_targets=[
+                s.strip()
+                for s in saved_args.get("lora_targets", "qkv,proj").split(",")
+                if s.strip()
+            ],
+            lora_dropout=saved_args.get("lora_dropout", 0.0),
+            transformer_depth=saved_args.get("transformer_depth", 2),
+            transformer_heads=saved_args.get("transformer_heads", 8),
+            device=device,
+        ).to(device)
+    else:
+        model = FlexiCTSliceVolumeClassifier(
+            checkpoint=str(BACKBONE_CHECKPOINT_PATH),
+            num_classes=num_classes,
+            slice_pool=saved_args["slice_pool"],
+            modality_pool=saved_args["modality_pool"],
+            slice_axis=saved_args["slice_axis"],
+            slice_size=saved_args["slice_size"],
+            patch_size=saved_args["patch_size"],
+            max_slices=saved_args["max_slices"],
+            encoder_tuning="frozen",
+            lora_r=saved_args.get("lora_r", 16),
+            lora_alpha=saved_args.get("lora_alpha", 16),
+            lora_targets=[
+                s.strip()
+                for s in saved_args.get("lora_targets", "qkv,proj").split(",")
+                if s.strip()
+            ],
+            lora_dropout=saved_args.get("lora_dropout", 0.0),
+            transformer_depth=saved_args.get("transformer_depth", 2),
+            transformer_heads=saved_args.get("transformer_heads", 8),
+            device=device,
+        ).to(device)
 
     model.load_state_dict(ckpt["model"])
     model.eval()
@@ -294,17 +402,8 @@ def predict_single_model(
     ckpt = torch.load(str(model_path), map_location="cpu")
     model, saved_args = build_model(ckpt, device)
 
-    # Apply resize if the model was trained with --resize_hw
-    resize_hw_raw = saved_args.get("resize_hw")
-    resize_hw = None
-    if resize_hw_raw not in (None, "none", "null"):
-        parts = tuple(int(x) for x in str(resize_hw_raw).split(",") if x.strip())
-        if len(parts) == 2:
-            resize_hw = parts
-    vol = resize_volume_chwd(volume.clone(), resize_hw)
-
     # Add batch dimension: [1, C, H, W, D]
-    vol = vol.unsqueeze(0).to(device=device, dtype=torch.float32)
+    vol = volume.unsqueeze(0).to(device=device, dtype=torch.float32)
 
     modality_pool = saved_args.get("modality_pool", "mean")
     slice_batch_size = int(saved_args.get("slice_batch_size", 32))
@@ -335,17 +434,20 @@ def main():
     # ── Discover ensemble checkpoints ─────────────────────────────────────────
     model_paths = get_model_paths()
     n_models = len(model_paths)
-    print(f"Backbone checkpoint: {FLEXICT_2D_CHECKPOINT_PATH}")
+    print(f"Backbone kind: {BACKBONE_KIND}")
+    print(f"Backbone checkpoint: {BACKBONE_CHECKPOINT_PATH}")
     print(f"Ensemble size: {n_models} model(s)")
     print_selected_folds_summary(model_paths)
 
     # ── Load and preprocess input volumes ─────────────────────────────────────
-    volume = collect_modalities(args)  # [C, H, W, D]
+    volume, spacings_xy = collect_modalities(args)  # [C, H, W, D]
 
     # ── Run inference (ensemble if multiple models) ───────────────────────────
     probabilities = []
     for i, model_path in enumerate(model_paths):
-        prob = predict_single_model(model_path, volume, device)
+        ckpt = torch.load(str(model_path), map_location="cpu")
+        processed_volume = preprocess_volume(volume, spacings_xy, ckpt["args"])
+        prob = predict_single_model(model_path, processed_volume, device)
         probabilities.append(prob)
         print(f"  Model [{i}] probability: {prob:.4f}")
 
