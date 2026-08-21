@@ -1,5 +1,16 @@
 #!/usr/bin/env bash
-set -euo pipefail
+#SBATCH --job-name=test
+#SBATCH --output=sbatch_log/test_%j.out
+#SBATCH --nodes=1
+#SBATCH --time=24:00:00
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=160GB
+
+# source /usr/bmicnas03/data-biwi-01/qimaqi_data/data/miniconda3/etc/profile.d/conda.sh
+# conda activate flexict
+# set -euo pipefail
+
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATASET_DIR="${1:-/usr/bmicnas02/data-biwi-01/bmicdatasets-originals/Originals/Challenge_Datasets/FOMO_Tasks/Task_2/Task_2}"
