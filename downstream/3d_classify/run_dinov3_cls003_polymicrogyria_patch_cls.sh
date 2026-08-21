@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=run_fomo_cls003_polymicrogyria_patch_cls
-#SBATCH --output=sbatch_log/run_fomo_cls003_polymicrogyria_patch_cls_%j.out
+#SBATCH --job-name=run_dinov3_cls003_polymicrogyria_patch_cls
+#SBATCH --output=sbatch_log/run_dinov3_cls003_polymicrogyria_patch_cls_%j.out
 #SBATCH --nodes=1
 #SBATCH --time=24:00:00
 #SBATCH --gres=gpu:0
@@ -42,7 +42,7 @@ fi
 EXTRA_ARGS+=(--mri_normalization robust_zscore --mri_low_percentile 0.5 --mri_high_percentile 99.5)
 
 for fold in {0..19}; do
-  python downstream/3d_classify/dinov3_finetune_cls_from_slices.py   --task "${TASK_NAME}"   --processed_root "${PROCESSED_ROOT}"   --raw_root "${RAW_ROOT}"   --output_dir "${OUTPUT_ROOT}"   --dinov3_checkpoint "${DINOV3_2D_CHECKPOINT}"   --train_split "${TRAIN_SPLIT}"   --test_split "${TEST_SPLIT}"   --fold "${fold}"   --slice_pool patch_cls   --modality_pool each   --batch_size 1   --slice_batch_size 32   --epochs 200   --cache   --cache_path "${FOMO_CACHE_ROOT}"   "${EXTRA_ARGS[@]}"
+  python downstream/3d_classify/dinov3_finetune_cls_from_slices.py   --task "${TASK_NAME}"   --processed_root "${PROCESSED_ROOT}"   --raw_root "${RAW_ROOT}"   --output_dir "${OUTPUT_ROOT}"   --dinov3_checkpoint "${DINOV3_2D_CHECKPOINT}"   --train_split "${TRAIN_SPLIT}"   --test_split "${TEST_SPLIT}"   --fold "${fold}"   --slice_pool patch_cls   --modality_pool each   --batch_size 1   --slice_batch_size 32   --epochs 75   --cache   --cache_path "${FOMO_CACHE_ROOT}"   "${EXTRA_ARGS[@]}"
 done
 
 python downstream/3d_classify/rank_cls_results.py \

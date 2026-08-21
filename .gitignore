@@ -19,3 +19,7 @@ ckpts
 
 challenge_submission_flex/task1/weights
 challenge_submission_flex/task1/weights_flex/
+
+challenge_submission_flex/task1/weights_dinov3/
+*.zip
+*.sif 

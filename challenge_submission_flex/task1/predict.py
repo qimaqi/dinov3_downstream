@@ -2,7 +2,7 @@
 """FOMO26 Task 1: Infarct Detection (Binary Classification).
 
 Predicts the probability of infarct presence from multi-modal brain MRI.
-Uses FlexiCT 2D slice encoder + cross-slice pooling (patch_cls) + classification head.
+Uses the DINOv3 2D slice encoder + cross-slice pooling (patch_cls) + classification head.
 
 Supports model ensembling: averages predictions from the top 3 selected folds.
 
@@ -74,7 +74,7 @@ if BACKBONE_KIND == "dinov3":
         REPO_ROOT
         / "results"
         / "3d_classify"
-        / "dinov3_slice_cls_each_robust_zscore"
+        / "dinov3_slice_cls_each_robust_zscore_split_v0_repeat10_val4"
         / "CLS002_FOMO26_Infarct"
     )
 else:
@@ -91,7 +91,7 @@ if _selected_folds_env:
         fold.strip() for fold in _selected_folds_env.split(",") if fold.strip()
     )
 else:
-    SELECTED_FOLDS = ("fold_0", "fold_2", "fold_4")
+    SELECTED_FOLDS = ("fold_9", "fold_5", "fold_8")
 
 
 def _resolve_backbone_checkpoint() -> Path:
@@ -174,9 +174,19 @@ FlexiCTSliceVolumeClassifier = _TRAIN_MODULE.FlexiCTSliceVolumeClassifier
 _parse_hw_resize = _TRAIN_MODULE._parse_hw_resize
 _parse_spacing_xy = _TRAIN_MODULE._parse_spacing_xy
 normalize_volume_chwd = _TRAIN_MODULE.normalize_volume_chwd
-pad_volume_chwd = _TRAIN_MODULE.pad_volume_chwd
+center_crop_or_pad_volume_chwd = _TRAIN_MODULE.center_crop_or_pad_volume_chwd
 respace_xy_volume_chwd = _TRAIN_MODULE.respace_xy_volume_chwd
 resize_volume_chwd = _TRAIN_MODULE.resize_volume_chwd
+
+
+def _env_or_saved(saved_args: dict, env_name: str, arg_name: str, default: str | None) -> str | None:
+    env_value = os.environ.get(env_name)
+    if env_value is not None and env_value != "":
+        return env_value
+    saved_value = saved_args.get(arg_name)
+    if saved_value is not None:
+        return str(saved_value)
+    return default
 
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
@@ -248,9 +258,15 @@ def preprocess_volume(
     saved_args: dict,
 ) -> torch.Tensor:
     """Match training-time volume preprocessing as closely as possible."""
-    resize_hw = _parse_hw_resize(saved_args.get("resize_hw"))
-    target_spacing_xy = _parse_spacing_xy(saved_args.get("target_spacing_xy"))
-    pad_hw = _parse_hw_resize(saved_args.get("pad_hw"))
+    resize_hw = _parse_hw_resize(
+        _env_or_saved(saved_args, "TASK1_RESIZE_HW", "resize_hw", "none")
+    )
+    target_spacing_xy = _parse_spacing_xy(
+        _env_or_saved(saved_args, "TASK1_TARGET_SPACING_XY", "target_spacing_xy", "1.0,1.0")
+    )
+    pad_hw = _parse_hw_resize(
+        _env_or_saved(saved_args, "TASK1_PAD_HW", "pad_hw", "256,256")
+    )
     mri_normalization = saved_args.get("mri_normalization", "robust_zscore")
     mri_low_percentile = float(saved_args.get("mri_low_percentile", 0.5))
     mri_high_percentile = float(saved_args.get("mri_high_percentile", 99.5))
@@ -259,7 +275,7 @@ def preprocess_volume(
     for channel_idx in range(volume.shape[0]):
         channel = volume[channel_idx : channel_idx + 1].clone()
         channel = respace_xy_volume_chwd(channel, spacings_xy[channel_idx], target_spacing_xy)
-        channel = pad_volume_chwd(channel, pad_hw)
+        channel = center_crop_or_pad_volume_chwd(channel, pad_hw)
         channel = resize_volume_chwd(channel, resize_hw)
         channel = normalize_volume_chwd(
             channel,
@@ -435,6 +451,9 @@ def main():
     print(f"Backbone kind: {BACKBONE_KIND}")
     print(f"Backbone checkpoint: {BACKBONE_CHECKPOINT_PATH}")
     print(f"Ensemble size: {n_models} model(s)")
+    print(f"Target spacing XY: {os.environ.get('TASK1_TARGET_SPACING_XY', '1.0,1.0')}")
+    print(f"Pad HW: {os.environ.get('TASK1_PAD_HW', '256,256')}")
+    print(f"Resize HW: {os.environ.get('TASK1_RESIZE_HW', 'none')}")
     print_selected_folds_summary(model_paths)
 
     # ── Load and preprocess input volumes ─────────────────────────────────────
