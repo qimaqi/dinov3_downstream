@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Build the Apptainer container for Task 1 (Infarct Detection)
-# Usage: bash setup_build_task1.sh
+# Requires: conda env "apptainer-test" with apptainer and fakeroot installed
+# Usage: bash setup_build_task1_crux.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,10 +9,16 @@ cd "${SCRIPT_DIR}"
 
 SIF_NAME="task1_infarct.sif"
 
+# Activate conda environment with apptainer + fakeroot
+eval "$(conda shell.bash hook)"
+conda activate apptainer-test
+
 echo "=== Building Task 1 container ==="
 echo "  Working dir: ${SCRIPT_DIR}"
 echo "  Definition:  Apptainer.def"
 echo "  Output:      ${SIF_NAME}"
+echo "  Conda env:   apptainer-test"
+echo "  Apptainer:   $(which apptainer)"
 echo ""
 
 # Verify repo structure is accessible

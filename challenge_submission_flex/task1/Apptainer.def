@@ -40,6 +40,8 @@ From: pytorch/pytorch:2.11.0-cuda12.6-cudnn9-runtime
 
 %post
     mkdir -p /input /output /app
+    # Remove PEP 668 "externally-managed" marker so pip works inside the container
+    rm -f /usr/lib/python*/EXTERNALLY-MANAGED
     pip install --no-cache-dir -U pip
     pip install --no-cache-dir -r /app/requirements.txt
     chmod +x /app/predict.py

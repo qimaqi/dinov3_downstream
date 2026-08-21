@@ -122,6 +122,8 @@ def _load_module(script_path: Path, module_name: str):
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot load module from {script_path}")
     module = importlib.util.module_from_spec(spec)
+    # Register in sys.modules BEFORE exec so @dataclass can resolve the module
+    sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
 
