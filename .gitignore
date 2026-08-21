@@ -13,6 +13,10 @@ CLAUDE.md
 
 
 *.out
+*.sif
+*.zip
+*.pt
+challenge_submission_flex/task1/weights_dinov3
 
 downstream/container-validator-main/
 ckpts

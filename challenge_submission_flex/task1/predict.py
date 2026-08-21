@@ -165,6 +165,8 @@ def _load_module(script_path: Path, module_name: str):
     # Register the module before execution so decorators like @dataclass
     # can resolve __module__ through sys.modules during import.
     sys.modules[module_name] = module
+    # Register in sys.modules BEFORE exec so @dataclass can resolve the module
+    # sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
 
