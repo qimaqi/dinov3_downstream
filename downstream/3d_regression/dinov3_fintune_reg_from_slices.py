@@ -97,19 +97,20 @@ def _make_5fold_splits(cases: list[str], seed: int) -> tuple[list[dict[str, list
     rng = np.random.default_rng(seed)
     shuffled = np.array(sorted(cases), dtype=object)
     rng.shuffle(shuffled)
-    fold_arrays = [fold.tolist() for fold in np.array_split(shuffled, 5)]
+    shared_test_cases = np.array_split(shuffled, 5)[0].tolist()
+    train_val_pool = shuffled[len(shared_test_cases) :]
+    fold_arrays = [fold.tolist() for fold in np.array_split(train_val_pool, 5)]
 
     train_val_folds = []
     test_folds = []
     for fold_idx in range(5):
         val_cases = fold_arrays[fold_idx]
-        test_cases = fold_arrays[(fold_idx + 1) % 5]
         train_cases = []
         for idx, fold_cases in enumerate(fold_arrays):
-            if idx not in {fold_idx, (fold_idx + 1) % 5}:
+            if idx != fold_idx:
                 train_cases.extend(fold_cases)
         train_val_folds.append({"train": sorted(train_cases), "val": sorted(val_cases)})
-        test_folds.append({"test": sorted(test_cases)})
+        test_folds.append({"test": sorted(shared_test_cases)})
     return train_val_folds, test_folds
 
 
@@ -312,14 +313,21 @@ class DINOv3SliceVolumeRegressor(nn.Module):
         indices = self._slice_selection_indices(slices.shape[1], device=slices.device)
         return indices.detach().cpu().tolist()
 
+    def _num_views(self, volume: torch.Tensor) -> int:
+        if volume.ndim != 5:
+            raise ValueError(f"Expected [B,C,H,W,D], got {tuple(volume.shape)}")
+        if self.modality_pool == "first":
+            return 1
+        if self.modality_pool in {"mean", "each"}:
+            return int(volume.shape[1])
+        raise ValueError(f"Unknown modality_pool: {self.modality_pool}")
+
     def modality_views(self, volume: torch.Tensor) -> torch.Tensor:
         if volume.ndim != 5:
             raise ValueError(f"Expected [B,C,H,W,D], got {tuple(volume.shape)}")
-        if self.modality_pool == "each":
+        if self.modality_pool in {"mean", "each"}:
             batch, channels, height, width, depth = volume.shape
             return volume.permute(0, 1, 2, 3, 4).reshape(batch * channels, 1, height, width, depth)
-        if self.modality_pool == "mean":
-            return volume.mean(dim=1, keepdim=True)
         if self.modality_pool == "first":
             return volume[:, :1]
         raise ValueError(f"Unknown modality_pool: {self.modality_pool}")
@@ -376,6 +384,7 @@ class DINOv3SliceVolumeRegressor(nn.Module):
         return cls_tokens
 
     def encode_slice_tokens(self, volume: torch.Tensor, slice_batch_size: int) -> dict[str, torch.Tensor]:
+        num_views = self._num_views(volume)
         slices = self._volume_to_slices(volume)
         idx = self._slice_selection_indices(slices.shape[1], device=slices.device)
         slices = slices.index_select(1, idx)
@@ -392,7 +401,9 @@ class DINOv3SliceVolumeRegressor(nn.Module):
         else:
             for start in range(0, flat.shape[0], slice_batch_size):
                 encoded_batches.append(self._encode_slice_batch(flat[start : start + slice_batch_size]))
-        return self._stack_encoded_slices(encoded_batches, batch=batch, n_slices=n_slices)
+        encoded = self._stack_encoded_slices(encoded_batches, batch=batch, n_slices=n_slices)
+        encoded["num_views"] = torch.tensor(num_views, device=flat.device, dtype=torch.int64)
+        return encoded
 
     def forward_features(
         self,
@@ -405,7 +416,17 @@ class DINOv3SliceVolumeRegressor(nn.Module):
                 raise ValueError("Either volume or cached_features must be provided.")
             cached_features = self.encode_slice_tokens(volume, slice_batch_size=slice_batch_size)
         slice_tokens = self._compose_slice_features(cached_features)
-        return self.slice_pool(slice_tokens)
+        volume_tokens = self.slice_pool(slice_tokens)
+        num_views = int(cached_features.get("num_views", torch.tensor(1)).item())
+        batch_size = volume_tokens.shape[0] // max(1, num_views)
+        volume_tokens = volume_tokens.view(batch_size, num_views, -1)
+        if self.modality_pool == "mean":
+            return volume_tokens.mean(dim=1)
+        if self.modality_pool == "each":
+            return volume_tokens
+        if self.modality_pool == "first":
+            return volume_tokens[:, 0, :]
+        raise ValueError(f"Unknown modality_pool: {self.modality_pool}")
 
     def forward(
         self,
@@ -418,12 +439,33 @@ class DINOv3SliceVolumeRegressor(nn.Module):
             slice_batch_size=slice_batch_size,
             cached_features=cached_features,
         )
+        if self.modality_pool == "each":
+            return self.head(volume_token).mean(dim=1)
+        return self.head(volume_token)
+
+    def forward_each(
+        self,
+        volume: torch.Tensor | None = None,
+        slice_batch_size: int = 32,
+        cached_features: dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        volume_token = self.forward_features(
+            volume=volume,
+            slice_batch_size=slice_batch_size,
+            cached_features=cached_features,
+        )
+        if self.modality_pool != "each":
+            pred = self.head(volume_token)
+            return pred.unsqueeze(1)
         return self.head(volume_token)
 
 
 def _prepare_cached_batch(cached_list: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
     keys = ("cls_tokens", "patch_tokens", "register_tokens")
-    return {key: torch.cat([item[key] for item in cached_list], dim=0) for key in keys}
+    batch = {key: torch.cat([item[key] for item in cached_list], dim=0) for key in keys}
+    if cached_list and "num_views" in cached_list[0]:
+        batch["num_views"] = torch.stack([item["num_views"] for item in cached_list]).flatten()
+    return batch
 
 
 def _load_cached_slices(cache_files: list[Path], device: torch.device) -> dict[str, torch.Tensor]:
@@ -475,7 +517,9 @@ def maybe_load_or_create_cached_features(
         missing = [str(path) for sample_paths in cache_files for path in sample_paths if not path.exists()]
         if missing:
             raise FileNotFoundError(f"Missing cached features in --from_cache_path: {missing[0]}")
-        return None, _prepare_cached_batch([_load_cached_slices(sample_paths, device) for sample_paths in cache_files])
+        cached = _prepare_cached_batch([_load_cached_slices(sample_paths, device) for sample_paths in cache_files])
+        cached["num_views"] = torch.full((len(cache_files),), int(images.shape[1] if args.modality_pool in {"mean", "each"} else 1), device=device, dtype=torch.int64)
+        return None, cached
 
     if not args.cache:
         return images, None
@@ -495,7 +539,9 @@ def maybe_load_or_create_cached_features(
                 torch.save(sample_cache, cache_file)
 
     cached = [_load_cached_slices(sample_paths, device) for sample_paths in cache_files]
-    return None, _prepare_cached_batch(cached)
+    cached_batch = _prepare_cached_batch(cached)
+    cached_batch["num_views"] = torch.full((len(cache_files),), int(images.shape[1] if args.modality_pool in {"mean", "each"} else 1), device=device, dtype=torch.int64)
+    return None, cached_batch
 
 
 def regression_metrics(pred: np.ndarray, labels: np.ndarray) -> dict[str, float]:
@@ -507,6 +553,14 @@ def regression_metrics(pred: np.ndarray, labels: np.ndarray) -> dict[str, float]
         "mae": float(mean_absolute_error(labels, pred)),
         "r2": float(r2_score(labels, pred)) if len(labels) > 1 else float("nan"),
     }
+
+
+def _reshape_predictions_by_modality(
+    pred: torch.Tensor,
+    batch_size: int,
+    num_modalities: int,
+) -> torch.Tensor:
+    return pred.view(batch_size, num_modalities, -1)
 
 
 def evaluate(
@@ -523,6 +577,8 @@ def evaluate(
     total_loss = 0.0
     n_seen = 0
     loss_fn = nn.MSELoss()
+    per_modality_losses: list[float] | None = None
+    per_modality_abs_errors: list[float] | None = None
     with torch.no_grad():
         for batch in loader:
             x, cached_features = maybe_load_or_create_cached_features(
@@ -536,7 +592,23 @@ def evaluate(
             y = batch["label"].to(device).float()
             if y.ndim == 1:
                 y = y.unsqueeze(1)
-            pred = model(x, slice_batch_size=slice_batch_size, cached_features=cached_features)
+            if args.modality_pool == "each":
+                num_modalities = int(batch["image"].shape[1])
+                pred_each = model.forward_each(
+                    x,
+                    slice_batch_size=slice_batch_size,
+                    cached_features=cached_features,
+                )
+                pred = pred_each.mean(dim=1)
+                if per_modality_losses is None:
+                    per_modality_losses = [0.0 for _ in range(num_modalities)]
+                    per_modality_abs_errors = [0.0 for _ in range(num_modalities)]
+                for modality_idx in range(num_modalities):
+                    modality_pred = pred_each[:, modality_idx, :]
+                    per_modality_losses[modality_idx] += float(loss_fn(modality_pred, y).item()) * y.shape[0]
+                    per_modality_abs_errors[modality_idx] += float((modality_pred - y).abs().sum().item())
+            else:
+                pred = model(x, slice_batch_size=slice_batch_size, cached_features=cached_features)
             loss = loss_fn(pred, y)
             total_loss += float(loss.item()) * y.shape[0]
             n_seen += y.shape[0]
@@ -546,6 +618,10 @@ def evaluate(
     y_true = np.concatenate(labels, axis=0)
     metrics = regression_metrics(y_pred, y_true)
     metrics["loss"] = total_loss / max(1, n_seen)
+    if per_modality_losses is not None and per_modality_abs_errors is not None:
+        for modality_idx, modality_loss in enumerate(per_modality_losses):
+            metrics[f"loss_modality_{modality_idx}"] = modality_loss / max(1, n_seen)
+            metrics[f"mae_modality_{modality_idx}"] = per_modality_abs_errors[modality_idx] / max(1, n_seen)
     return metrics
 
 
@@ -653,6 +729,7 @@ def run_one_task(args: argparse.Namespace, task: str) -> None:
         if args.encoder_tuning == "frozen":
             model.encoder.eval()
         train_loss = 0.0
+        train_loss_fused = 0.0
         n_seen = 0
         progress = tqdm(train_loader, desc=f"{task} epoch {epoch + 1}/{args.epochs}", leave=False)
         for batch in progress:
@@ -667,23 +744,52 @@ def run_one_task(args: argparse.Namespace, task: str) -> None:
             y = batch["label"].to(device).float()
             if y.ndim == 1:
                 y = y.unsqueeze(1)
-            pred = model(x, slice_batch_size=args.slice_batch_size, cached_features=cached_features)
-            loss = loss_fn(pred, y)
+            if args.modality_pool == "each":
+                num_modalities = int(batch["image"].shape[1])
+                pred_each = model.forward_each(
+                    x,
+                    slice_batch_size=args.slice_batch_size,
+                    cached_features=cached_features,
+                )
+                y_each = y.unsqueeze(1).expand(-1, num_modalities, -1)
+                loss = loss_fn(pred_each, y_each)
+                pred = pred_each.mean(dim=1)
+                fused_loss = loss_fn(pred, y)
+            else:
+                pred = model(x, slice_batch_size=args.slice_batch_size, cached_features=cached_features)
+                loss = loss_fn(pred, y)
+                fused_loss = loss
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
 
             train_loss += float(loss.item()) * y.shape[0]
+            train_loss_fused += float(fused_loss.item()) * y.shape[0]
             n_seen += y.shape[0]
-            progress.set_postfix(loss=train_loss / max(1, n_seen))
+            if args.modality_pool == "each":
+                progress.set_postfix(loss=train_loss / max(1, n_seen), fused=train_loss_fused / max(1, n_seen))
+            else:
+                progress.set_postfix(loss=train_loss / max(1, n_seen))
 
         val_metrics = evaluate(args, task, model, val_loader, device=device, slice_batch_size=args.slice_batch_size)
-        print(
+        val_message = (
             f"epoch={epoch + 1:03d} train_loss={train_loss / max(1, n_seen):.4f} "
+            f"train_loss_fused={train_loss_fused / max(1, n_seen):.4f} "
             f"val_loss={val_metrics['loss']:.4f} val_mae={val_metrics['mae']:.4f} "
             f"val_rmse={val_metrics['rmse']:.4f} val_r2={val_metrics['r2']:.4f}"
         )
+        if args.modality_pool == "each":
+            modality_idx = 0
+            per_modality_parts = []
+            while f"loss_modality_{modality_idx}" in val_metrics:
+                per_modality_parts.append(
+                    f"val_loss_m{modality_idx}={val_metrics[f'loss_modality_{modality_idx}']:.4f}"
+                )
+                modality_idx += 1
+            if per_modality_parts:
+                val_message += " " + " ".join(per_modality_parts)
+        print(val_message)
         if val_metrics["loss"] < best_val_loss:
             best_val_loss = val_metrics["loss"]
             best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
@@ -691,10 +797,21 @@ def run_one_task(args: argparse.Namespace, task: str) -> None:
     if best_state is not None:
         model.load_state_dict(best_state)
     test_metrics = evaluate(args, task, model, test_loader, device=device, slice_batch_size=args.slice_batch_size)
-    print(
+    test_message = (
         f"[test] {task} loss={test_metrics['loss']:.4f} mae={test_metrics['mae']:.4f} "
         f"rmse={test_metrics['rmse']:.4f} r2={test_metrics['r2']:.4f}"
     )
+    if args.modality_pool == "each":
+        modality_idx = 0
+        per_modality_parts = []
+        while f"loss_modality_{modality_idx}" in test_metrics:
+            per_modality_parts.append(
+                f"loss_m{modality_idx}={test_metrics[f'loss_modality_{modality_idx}']:.4f}"
+            )
+            modality_idx += 1
+        if per_modality_parts:
+            test_message += " " + " ".join(per_modality_parts)
+    print(test_message)
 
     torch.save(
         {

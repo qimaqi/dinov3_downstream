@@ -1,59 +1,39 @@
 Bootstrap: docker
-From: pytorch/pytorch:2.11.0-cuda12.6-cudnn9-runtime
+From: pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
 %labels
     Author FOMO26 Challenge
     Version v1.0.0
-    Description FOMO26 Task 2 - Meningioma Segmentation (FlexiCT Primus_Onescale linear, ensemble)
+    Description FOMO26 Task 2 - Meningioma segmentation with MedDINOv3 nnU-Net
 
 %environment
     export PYTHONUNBUFFERED=1
     export LC_ALL=C.UTF-8
     export PYTHONDONTWRITEBYTECODE=1
-    export MPLCONFIGDIR=/tmp/flexict_mplconfig
-    export FLEXICT_2D_CHECKPOINT=/app/weights/2D_final_model.pth
+    export MPLCONFIGDIR=/tmp/meddinov3_mplconfig
+    export DINOV3_2D_CHECKPOINT=/app/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
+    export nnUNet_compile=false
 
 %files
-    # ── Main inference script ─────────────────────────────────────────────────
     ./predict.py /app/predict.py
     ./requirements.txt /app/requirements.txt
-
-    # ── FlexiCT encoder source code ──────────────────────────────────────────
-    ./dinov3_downstream/flexi_ct /app/dinov3_downstream/flexi_ct
-
-    # ── nnU-Net source (with FlexiCT trainer) ────────────────────────────────
-    ./dinov3_downstream/downstream/__init__.py /app/dinov3_downstream/downstream/__init__.py
-    ./dinov3_downstream/downstream/segmentation/__init__.py /app/dinov3_downstream/downstream/segmentation/__init__.py
-    ./dinov3_downstream/downstream/segmentation/nnUNet /app/dinov3_downstream/downstream/segmentation/nnUNet
-
-    # ── Model weights ─────────────────────────────────────────────────────────
-    # Pretrained FlexiCT 2D backbone
-    ./weights/2D_final_model.pth /app/weights/2D_final_model.pth
-
-    # nnU-Net trained model folder (includes all folds for ensemble)
-    # Expected structure:
-    #   nnunet_model/plans.json
-    #   nnunet_model/dataset.json
-    #   nnunet_model/dataset_fingerprint.json
-    #   nnunet_model/fold_0/checkpoint_final.pth
-    #   nnunet_model/fold_1/checkpoint_final.pth
-    #   ...
-    ./weights/nnunet_model /app/weights/nnunet_model
+    ./nnUNet /app/nnUNet
+    ./weights /app/weights
 
 %post
-    mkdir -p /input /output /app /tmp/flexict_mplconfig
-    pip install --no-cache-dir -U pip
+    mkdir -p /app /input /output /tmp/meddinov3_mplconfig
+    pip install --no-cache-dir --upgrade pip
     pip install --no-cache-dir -r /app/requirements.txt
+    pip install --no-cache-dir -e /app/nnUNet
     chmod +x /app/predict.py
 
 %runscript
     exec python /app/predict.py "$@"
 
 %help
-    FOMO26 Task 2: Meningioma Segmentation (Binary)
-    Model: FlexiCT backbone + Primus_Onescale (linear decoder, frozen backbone)
-    Trainer: flexict_patch8_onescale_linear_Trainer
-    Ensemble: uses all available fold checkpoints
+    FOMO26 Task 2: FLAIR-only meningioma segmentation.
+    Model folder: dinov3_base_primus_Trainer_freeze_multi__nnUNetPlans__2d
+    Checkpoint: fold_0/checkpoint_best.pth
 
     Build:
         apptainer build --fakeroot task2_meningioma.sif Apptainer.def --arch amd64
@@ -64,7 +44,4 @@ From: pytorch/pytorch:2.11.0-cuda12.6-cudnn9-runtime
             --bind /path/to/output:/output \
             task2_meningioma.sif \
             --flair /input/flair.nii.gz \
-            --dwi /input/dwi.nii.gz \
-            --t2s /input/t2s.nii.gz \
-            --swi /input/swi.nii.gz \
             --output /output/segmentation.nii.gz
