@@ -28,6 +28,8 @@ challenge_submission_flex/task1/weights_dinov3/
 challenge_submission_flex/task6/weights/
 challenge_submission_flex/task2/weights/
 challenge_submission_flex/task2/test_predictions/
+challenge_submission_flex/task3/weights/
+challenge_submission_flex/task3/weights/*
 
 *.zip
-*.sif 
+*.sif challenge_submission_flex/task3/weights/2D_final_model.pth

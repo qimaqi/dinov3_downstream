@@ -5,7 +5,7 @@
 #SBATCH --time=24:00:00
 #SBATCH --gres=gpu:0
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=160GB
+#SBATCH --mem=240GB
 
 source /usr/bmicnas03/data-biwi-01/qimaqi_data/data/miniconda3/etc/profile.d/conda.sh
 conda activate flexict
@@ -41,7 +41,7 @@ if [[ "${UNFREEZE_ENCODER:-0}" == "1" ]]; then
 fi
 EXTRA_ARGS+=(--mri_normalization robust_zscore --mri_low_percentile 0.5 --mri_high_percentile 99.5)
 
-for fold in {0..19}; do
+for fold in {1..19}; do
   python downstream/3d_classify/dinov3_finetune_cls_from_slices.py   --task "${TASK_NAME}"   --processed_root "${PROCESSED_ROOT}"   --raw_root "${RAW_ROOT}"   --output_dir "${OUTPUT_ROOT}"   --dinov3_checkpoint "${DINOV3_2D_CHECKPOINT}"   --train_split "${TRAIN_SPLIT}"   --test_split "${TEST_SPLIT}"   --fold "${fold}"   --slice_pool patch_cls   --modality_pool each   --batch_size 1   --slice_batch_size 32   --epochs 75   --cache   --cache_path "${FOMO_CACHE_ROOT}"   "${EXTRA_ARGS[@]}"
 done
 
